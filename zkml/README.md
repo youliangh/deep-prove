@@ -6,7 +6,7 @@
 
 DeepProve is a framework for proving inference of neural networks using cryptographic techniques based on sumchecks and logup GKR. Proving time is sublinear in the size of the model, providing order-of-magnitude speedups compared to other inference proving frameworks.
 
-**First-class LLM support**: DeepProve proves end-to-end inference for transformer-based LLMs including **GPT-2**, **Gemma 3**, and **Llama 2**, covering all transformer layer types from embeddings through to next-token argmax. MLP and CNN inference is also supported.
+**First-class LLM support**: DeepProve proves end-to-end inference for transformer-based LLMs including **GPT-2**, **Gemma 3**, **Llama 2**, and **Llama 3**, covering all transformer layer types from embeddings through to next-token argmax. MLP and CNN inference is also supported.
 
 The framework quantizes weights and activations into a fixed zero-centered range. The default range is `[-2^11, 2^11-1]` (12-bit symmetric quantization); the bit width can be set via the `ZKML_BIT_LEN` environment variable (typical values: 8, 10, 12, 16).
 
@@ -56,6 +56,7 @@ The recommended path is **SafeTensors via Hugging Face**: pass `--hf <model-id>`
 | **GPT-2** | `--hf openai-community/gpt2` | SafeTensors auto-downloaded from HF. GGUF also supported (`--gguf gpt2.Q2_K.gguf`) |
 | **Gemma 3** | `--hf google/gemma-3-1b-it` | SafeTensors only |
 | **Llama 2** | `--hf meta-llama/Llama-2-7b-hf` | SafeTensors only. `--accuracy` mode currently falls back to default quantization for Llama 2 |
+| **Llama 3 / 3.2** | `--model llama3 --hf-dir /path/to/local/model` | SafeTensors; grouped-query attention, tied embeddings and Llama 3 scaled RoPE. Calibrated integer inference is always enabled. |
 
 Supported transformer layers:
 
@@ -66,6 +67,53 @@ Supported transformer layers:
 - **Softmax** — with provable range checks
 - **LayerNorm / RMSNorm** — vector normalization with proofs
 - **Argmax / Logits** — next-token prediction output layer
+
+### Offline verification of saved LLM proofs
+
+`bench-llm --artifacts-dir DIR` saves the verified proof, public IO, verifier
+context, prompt and continuation token IDs, text, and a setup record in
+`result.json`. For a text prompt, use `--prompt TEXT --max-new-tokens N`; for an
+exact token sequence, use `--prompt-tokens prompt_tokens.json`. The certified
+context contains `prompt_length + N - 1` input positions, including the position
+which predicts the final generated token. Generation may stop earlier at EOS.
+
+To prove several requests with one frozen calibration and setup, use
+`--prompt-cases prompts.json`. This file is an array of objects with `name`,
+`prompt_tokens`, and `max_new_tokens` (the same format produced by
+`llama3_validation.py prepare`). Each request runs from reset caches and receives
+its own complete proof. Artifacts are written under `DIR/NAME/`, with an index in
+`DIR/cases.json`. Each saved verifier context binds that request's context limit;
+pin the exact per-request `verifier.bin` when verifying it independently.
+
+Build the standalone verifier with `cargo build --release -p zkml --bin verify-llm`.
+It requires no model weights and makes no network requests:
+
+```bash
+target/release/verify-llm \
+  --artifacts-dir /path/to/artifacts \
+  --verifier /trusted/setup/verifier.bin \
+  --verifier-sha256 "$TRUSTED_VERIFIER_SHA256" \
+  --prompt-tokens /trusted/request/prompt_tokens.json \
+  --tokenizer /trusted/model/tokenizer.json \
+  --tokenizer-sha256 "$TRUSTED_TOKENIZER_SHA256"
+```
+
+The verifier checks the cryptographic proof, public autoregressive sequence,
+prompt, and agreement of frozen token IDs with `result.json`. Supplying a
+tokenizer also checks `generated.txt` and the recorded full text against the
+certified IDs. Without `--tokenizer`, only token IDs are certified and the JSON
+response explicitly reports `text_verified: false`. Without `--prompt-tokens`,
+the prompt is read from the artifact directory and is reported as the verified
+statement; supply the expected request separately when that distinction matters.
+
+`--verifier` is mandatory: its association with the intended model, quantization
+and setup must be established externally. The optional SHA256 pin should come
+from a trusted setup record. `result.json` records the generated verifier's
+SHA256 for reproducibility, but a hash supplied by an untrusted artifact
+directory does not establish trust. Using that directory's own `verifier.bin`
+performs a reproducible self-check; it does not independently establish which
+model was committed. The same external trust requirement applies to the
+tokenizer used to interpret certified IDs as text.
 
 ### Traditional (MLP / CNN)
 

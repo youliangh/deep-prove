@@ -12,6 +12,7 @@ use itertools::izip;
 use serde::{Deserialize, Serialize};
 
 pub mod proving;
+pub(crate) mod rms;
 pub mod verifying;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +335,14 @@ impl LookupVariant {
                         Expression::<F>::Challenge((1 + total_chunks) as u16, 2, pow_two, F::ZERO);
                     output_part +=
                         sum_norm_challenge * (normalisation_eq.clone() * prod_expression);
+                } else {
+                    // The multiplier is constant along the last dimension, so
+                    // averaging it with normalisation_eq needs no dimension factor.
+                    let multiplier_challenge =
+                        Expression::<F>::Challenge((1 + total_chunks) as u16, 2, F::ONE, F::ZERO);
+                    output_part += multiplier_challenge
+                        * normalisation_eq.clone()
+                        * scaling_witness_expression.clone();
                 };
 
                 chunk_challenge

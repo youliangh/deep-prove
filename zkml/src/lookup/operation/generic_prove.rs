@@ -107,15 +107,23 @@ where
 
     let (lookup_polys, others) = layer_polys.split_at(number_of_chunks * lookup_polys_per_chunk);
 
+    let normalisers = variant.is_rmsnorm().then(|| &others[..number_of_chunks]);
+
     // Generate the LogUp proof
     // First we have to sort and pair off the MLEs for the LogUp proof.
     let logup_inputs = if !variant.requires_output() {
-        input_config.create_logup_inputs::<F>(lookup_polys, None, &prover.challenge_storage)?
+        input_config.create_logup_inputs::<F>(
+            lookup_polys,
+            None,
+            normalisers,
+            &prover.challenge_storage,
+        )?
     } else if weight_tensor.is_none() {
         let output = step.output_tensor_at(0)?;
         input_config.create_logup_inputs::<F>(
             lookup_polys,
             Some(output.as_ref()),
+            normalisers,
             &prover.challenge_storage,
         )?
     } else {
@@ -126,6 +134,7 @@ where
         input_config.create_logup_inputs::<F>(
             lookup_polys,
             Some(&output),
+            normalisers,
             &prover.challenge_storage,
         )?
     };

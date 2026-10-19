@@ -109,6 +109,57 @@ impl<F: PrimeField> IO<F> {
     pub fn inputs(&self) -> &[Tensor<SerializableField<F>>] {
         &self.input
     }
+
+    /// Bind cached chunk IO to the full public tensors used by the LLM statement.
+    pub(crate) fn validate_split_binding(&self) -> anyhow::Result<()> {
+        for (full, split) in [
+            (&self.input, self.splitted_inputs.as_ref()),
+            (&self.output, self.splitted_outputs.as_ref()),
+        ] {
+            let Some(split) = split else { continue };
+            let mut split_info = SplittedIOInfo::new();
+            for (&index, chunks) in split {
+                let tensor = full
+                    .get(index)
+                    .ok_or_else(|| anyhow!("Invalid split IO index"))?;
+                tensor.validate_shape()?;
+                ensure!(
+                    !chunks.is_empty() && chunks.len() <= tensor.unpadded_shape().dim(0),
+                    "Invalid split IO chunk count"
+                );
+                let rows = tensor.unpadded_shape().dim(0);
+                let padded_rows = rows
+                    .checked_next_power_of_two()
+                    .context("Split IO row count overflows")?;
+                let padded_chunks = chunks
+                    .len()
+                    .checked_next_power_of_two()
+                    .context("Split IO chunk count overflows")?;
+                let chunk_size = padded_rows / padded_chunks;
+                ensure!(
+                    chunk_size > 0 && rows.div_ceil(chunk_size) == chunks.len(),
+                    "Split IO chunk count would create missing or empty chunks"
+                );
+                for chunk in chunks {
+                    chunk.validate_shape()?;
+                }
+                // Only the number of nodes is used to reconstruct the split.
+                split_info.insert(index, vec![NodeId::from(0); chunks.len()]);
+            }
+            let expected = split_io_tensors(&split_info, full)?;
+            for (&index, chunks) in split {
+                for (actual, expected) in chunks.iter().zip(&expected[&index]) {
+                    ensure!(
+                        actual.shape() == expected.shape()
+                            && actual.unpadded_shape() == expected.unpadded_shape()
+                            && actual.data() == expected.data(),
+                        "Split IO does not match the full public tensor"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct Verifier<'a, F: PrimeField, T: Transcript, PCS>

@@ -713,7 +713,7 @@ where
                     unpadded_shape: right_unpadded_shape,
                 },
             ) => {
-                let tensor = left.matmul(right);
+                let tensor = T::matmul(left, right)?;
                 let unpadded_shape = BShape::new([left_unpadded_shape[0], right_unpadded_shape[1]]);
 
                 Ok(WrappedTensor::Rank2 {
@@ -731,7 +731,7 @@ where
                     unpadded_shape: right_unpadded_shape,
                 },
             ) => {
-                let tensor = left.matmul(right);
+                let tensor = T::matmul(left, right)?;
                 let unpadded_shape = BShape::new([
                     batch_dim(left_unpadded_shape[0], right_unpadded_shape[0]),
                     left_unpadded_shape[1],
@@ -753,7 +753,7 @@ where
                     unpadded_shape: right_unpadded_shape,
                 },
             ) => {
-                let tensor = left.matmul(right);
+                let tensor = T::matmul(left, right)?;
                 let unpadded_shape = BShape::new([
                     batch_dim(left_unpadded_shape[0], right_unpadded_shape[0]),
                     batch_dim(left_unpadded_shape[1], right_unpadded_shape[1]),
@@ -2287,6 +2287,15 @@ pub trait TensorTypeParam:
     type Kind: BTensorKind<Backend> + BasicOps<Backend> + Numeric<Backend>;
 
     fn tensor_to_float(tensor: WrappedTensor<Self>) -> WrappedTensor<f32>;
+
+    /// Keep dtype dispatch outside the dynamic-rank wrapper. Float and GPU
+    /// tensors retain Burn's existing high-level validation and kernels.
+    fn matmul<const D: usize>(
+        lhs: BTensor<Backend, D, Self::Kind>,
+        rhs: BTensor<Backend, D, Self::Kind>,
+    ) -> Result<BTensor<Backend, D, Self::Kind>> {
+        Ok(lhs.matmul(rhs))
+    }
 }
 
 impl TensorTypeParam for f32 {
@@ -2299,6 +2308,14 @@ impl TensorTypeParam for f32 {
 
 impl TensorTypeParam for Element {
     type Kind = burn::tensor::Int;
+
+    #[cfg(all(feature = "cpu", not(any(feature = "wgpu", feature = "cuda"))))]
+    fn matmul<const D: usize>(
+        lhs: BTensor<Backend, D, Self::Kind>,
+        rhs: BTensor<Backend, D, Self::Kind>,
+    ) -> Result<BTensor<Backend, D, Self::Kind>> {
+        crate::backend::zkml_matmul_i::<Backend, D>(lhs, rhs)
+    }
 
     fn tensor_to_float(tensor: WrappedTensor<Self>) -> WrappedTensor<f32> {
         tensor.float()

@@ -40,6 +40,14 @@ fn to_tensor<B: ZKMLBackend>(data: IntTensor<B>) -> anyhow::Result<Tensor<Elemen
 }
 
 pub(crate) trait ZKMLBackend: burn::tensor::backend::Backend {
+    /// Exact integer GEMM. CPU backends may override the generic Burn kernel.
+    fn zkml_matmul_i(
+        lhs: IntTensor<Self>,
+        rhs: IntTensor<Self>,
+    ) -> anyhow::Result<IntTensor<Self>> {
+        Ok(Self::int_matmul(lhs, rhs))
+    }
+
     /// Conv2D implementation over integers (only floats are supported by burn)
     fn zkml_conv2d_i(
         input: IntTensor<Self>,
@@ -81,6 +89,16 @@ pub(crate) trait ZKMLBackend: burn::tensor::backend::Backend {
             &device,
         ))
     }
+}
+
+pub(crate) fn zkml_matmul_i<B: ZKMLBackend, const D: usize>(
+    lhs: BTensor<B, D, Int>,
+    rhs: BTensor<B, D, Int>,
+) -> anyhow::Result<BTensor<B, D, Int>> {
+    Ok(BTensor::from_primitive(B::zkml_matmul_i(
+        lhs.into_primitive(),
+        rhs.into_primitive(),
+    )?))
 }
 
 pub(crate) fn zkml_conv2d_i<B: ZKMLBackend>(

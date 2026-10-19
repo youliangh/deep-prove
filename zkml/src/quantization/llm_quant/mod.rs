@@ -8,6 +8,7 @@ use anyhow::Result;
 
 pub mod gemma3;
 pub mod gpt2;
+pub mod llama3;
 pub mod rotation;
 
 pub trait FPTransformModel {

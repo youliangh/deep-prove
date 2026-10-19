@@ -21,6 +21,10 @@ path = "src/bin/bench/llm.rs"
 name = "extract-logits"
 path = "src/bin/extract_logits.rs"
 
+[[bin]]
+name = "verify-llm"
+path = "src/bin/verify_llm.rs"
+
 [features]
 default = ["cpu"]
 # Capture layers' quatization outputs for regression tests

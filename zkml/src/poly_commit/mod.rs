@@ -87,16 +87,63 @@ fn num_vars_for_chunk(poly_num_vars: usize, num_chunks: usize) -> usize {
     poly_num_vars - log2_strict(num_chunks)
 }
 
+/// Preserve summand order while bounding the expression's recursive traversal/drop depth.
+/// A left fold over all model and lookup claims can overflow the main thread's stack
+/// when dp-crypto expands the expression into monomials, before sumcheck even starts.
+fn balanced_expression_sum<F: PrimeField>(
+    summands: impl IntoIterator<Item = Expression<F>>,
+) -> Expression<F> {
+    let mut level = summands.into_iter().collect_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        let mut pairs = level.into_iter();
+        while let Some(left) = pairs.next() {
+            next.push(match pairs.next() {
+                Some(right) => left + right,
+                None => left,
+            });
+        }
+        level = next;
+    }
+    level.pop().unwrap_or(Expression::ZERO)
+}
+
 /// Build the sumcheck expression for the sumcheck employed in the opening proof to batch claims
 /// over the committed polynomials. It requires as input the information about the committed polynomials
 /// and how they are chunked in order to be committed
 fn build_sumcheck_expression<F: PrimeField>(
     chunked_poly_info: Vec<ChunkedCommittedPolyInfo<F>>,
 ) -> anyhow::Result<Expression<F>> {
+    // dp-crypto assigns u16 witness IDs and increments a u16 witness counter.
+    // Reject unsupported counts before either index cast below can truncate.
+    let mut witness_count = 0usize;
+    for info in &chunked_poly_info {
+        ensure!(
+            info.num_claims == info.batching_coefficients.len(),
+            "Expected {} claim coefficient rows, found {}",
+            info.num_claims,
+            info.batching_coefficients.len()
+        );
+        for count in [info.num_chunks, info.num_claims] {
+            ensure!(
+                count <= usize::from(u16::MAX) - witness_count,
+                "Opening expression exceeds the supported {} witness polynomials",
+                u16::MAX
+            );
+            witness_count += count;
+        }
+    }
     let eq_offset: usize = chunked_poly_info
         .iter()
         .map(|chunked_poly_info| chunked_poly_info.num_chunks)
         .sum();
+    tracing::info!(
+        committed_polynomials = chunked_poly_info.len(),
+        committed_chunks = eq_offset,
+        claims = witness_count - eq_offset,
+        witness_slots = witness_count,
+        "Building opening claims expression"
+    );
     // basically, for each pair of (poly, claim), we need to add a term to the sumcheck of the
     // type `challenge*poly*eq_poly(claim.point)`. Given that there might be more than one
     // input claim for each model polynomial, we need to make sure to use the same `poly`
@@ -108,43 +155,38 @@ fn build_sumcheck_expression<F: PrimeField>(
     // `poly` is replaced in each term of the expression by `C_1*P_1 + C_2*P_2 + ... + C_M*P_M`,
     // where `C_1,...,C_M` are the coefficients found in `chunked_poly_info` for each claim of
     // the polynomial `P` to be batched
-    chunked_poly_info
-        .into_iter()
-        .try_fold(
-            (Expression::Constant(F::ZERO), 0, 0),
-            |(expr, total_num_terms, total_polys), chunked_poly_info| {
-                let new_expr = chunked_poly_info
-                    .batching_coefficients
-                    .into_iter()
-                    .enumerate()
-                    .try_fold(expr, |inner_expr, (i, chunk_coeffs)| {
-                        ensure!(
-                            chunk_coeffs.len() == chunked_poly_info.num_chunks,
-                            "Expected {} chunk challenges, found {}",
-                            chunked_poly_info.num_chunks,
-                            chunk_coeffs.len()
-                        );
-                        let chunk_poly_expr = chunk_coeffs.into_iter().enumerate().fold(
-                            Expression::Constant(F::ZERO),
-                            |inner_expr, (chunk_index, coeff)| {
-                                inner_expr
-                                    + Expression::Constant(coeff)
-                                        * Expression::WitIn((total_polys + chunk_index) as u16)
-                            },
-                        );
-                        Ok(inner_expr
-                            + Expression::Challenge(0, total_num_terms + i, F::ONE, F::ZERO)
-                                * chunk_poly_expr
-                                * Expression::WitIn((total_num_terms + i + eq_offset) as u16))
-                    })?;
-                Ok((
-                    new_expr,
-                    total_num_terms + chunked_poly_info.num_claims,
-                    total_polys + chunked_poly_info.num_chunks,
-                ))
-            },
-        )
-        .map(|(expr, _, _)| expr)
+    let mut terms = vec![Expression::ZERO];
+    let (mut total_num_terms, mut total_polys) = (0, 0);
+    for chunked_poly_info in chunked_poly_info {
+        for (i, chunk_coeffs) in chunked_poly_info
+            .batching_coefficients
+            .into_iter()
+            .enumerate()
+        {
+            ensure!(
+                chunk_coeffs.len() == chunked_poly_info.num_chunks,
+                "Expected {} chunk challenges, found {}",
+                chunked_poly_info.num_chunks,
+                chunk_coeffs.len()
+            );
+            let chunk_poly_expr = balanced_expression_sum(
+                std::iter::once(Expression::ZERO).chain(chunk_coeffs.into_iter().enumerate().map(
+                    |(chunk_index, coeff)| {
+                        Expression::Constant(coeff)
+                            * Expression::WitIn((total_polys + chunk_index) as u16)
+                    },
+                )),
+            );
+            terms.push(
+                Expression::Challenge(0, total_num_terms + i, F::ONE, F::ZERO)
+                    * chunk_poly_expr
+                    * Expression::WitIn((total_num_terms + i + eq_offset) as u16),
+            );
+        }
+        total_num_terms += chunked_poly_info.num_claims;
+        total_polys += chunked_poly_info.num_chunks;
+    }
+    Ok(balanced_expression_sum(terms))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -196,11 +238,13 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use anyhow::anyhow;
-    use ark_ff::UniformRand;
+    use ark_ff::{AdditiveGroup, Field, UniformRand};
     use ark_std::rand::{Rng, rngs::StdRng};
     use dp_crypto::{
+        Expression,
         arkyper::{HyperKZG, transcript::blake3::Blake3Transcript},
         poly::dense::DensePolynomial,
+        utils::eval_by_expr,
     };
     use itertools::Itertools;
     use parking_lot::RwLockUpgradableReadGuard;
@@ -220,6 +264,164 @@ mod tests {
     type F = ark_bn254::Fr;
 
     type Pcs = HyperKZG<ark_bn254::Bn254>;
+
+    #[test]
+    fn test_opening_expression_preserves_claim_and_chunk_order() {
+        use super::{ChunkedCommittedPolyInfo, build_sumcheck_expression};
+
+        let expression = build_sumcheck_expression(vec![
+            ChunkedCommittedPolyInfo {
+                num_chunks: 2,
+                num_claims: 2,
+                batching_coefficients: vec![
+                    vec![F::from(2), -F::from(3)],
+                    vec![F::ZERO, F::from(5)],
+                ],
+            },
+            ChunkedCommittedPolyInfo {
+                num_chunks: 1,
+                num_claims: 3,
+                batching_coefficients: vec![
+                    vec![F::from(7)],
+                    vec![F::from(11)],
+                    vec![-F::from(13)],
+                ],
+            },
+        ])
+        .unwrap();
+        let witnesses = [3, 5, 7, 11, 13, 17, 19, 23].map(F::from);
+        let challenge = F::from(29);
+        // Two chunked-polynomial claims followed by three claims for another
+        // polynomial; EQ witnesses start after all three committed chunks.
+        let expected = (F::from(2 * 3) - F::from(3 * 5)) * F::from(11)
+            + challenge * F::from(5 * 5 * 13)
+            + challenge.pow([2]) * F::from(7 * 7 * 17)
+            + challenge.pow([3]) * F::from(11 * 7 * 19)
+            - challenge.pow([4]) * F::from(13 * 7 * 23);
+        assert_eq!(
+            eval_by_expr(&witnesses, &[], &[challenge], &expression),
+            expected
+        );
+
+        let expanded = expression.get_monomial_terms();
+        let expanded_value: F = expanded
+            .into_iter()
+            .map(|term| {
+                eval_by_expr(&witnesses, &[], &[challenge], &term.scalar)
+                    * term
+                        .product
+                        .iter()
+                        .map(|factor| eval_by_expr(&witnesses, &[], &[challenge], factor))
+                        .product::<F>()
+            })
+            .sum();
+        assert_eq!(expanded_value, expected);
+    }
+
+    #[test]
+    fn test_opening_expression_many_claims_on_small_stack() {
+        std::thread::Builder::new()
+            .name("opening-expression-small-stack".into())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                use super::{ChunkedCommittedPolyInfo, build_sumcheck_expression};
+
+                const POLYNOMIALS: usize = 3_000;
+                const CHUNKS: usize = 2;
+                const CLAIMS_PER_POLYNOMIAL: usize = 4;
+                const CLAIMS: usize = POLYNOMIALS * CLAIMS_PER_POLYNOMIAL;
+                const EQ_OFFSET: usize = POLYNOMIALS * CHUNKS;
+                // Small, one-variable MLEs isolate expression size from model
+                // size, SRS generation and the cost of a full-model proof.
+                let values = (0..EQ_OFFSET + CLAIMS)
+                    .map(|i| {
+                        DensePolynomial::new(vec![F::from((i + 1) as u64), F::from((i + 9) as u64)])
+                            .evaluate(&[F::from(7)])
+                            .unwrap()
+                    })
+                    .collect_vec();
+                let challenge = F::from(17);
+                let mut challenge_power = F::ONE;
+                let mut expected = F::ZERO;
+                let infos = (0..POLYNOMIALS)
+                    .map(|poly| {
+                        let batching_coefficients = (0..CLAIMS_PER_POLYNOMIAL)
+                            .map(|claim| {
+                                let coefficients =
+                                    vec![F::from((poly + 1) as u64), -F::from((claim + 2) as u64)];
+                                let chunk_value = coefficients[0] * values[poly * CHUNKS]
+                                    + coefficients[1] * values[poly * CHUNKS + 1];
+                                expected += challenge_power
+                                    * chunk_value
+                                    * values[EQ_OFFSET + poly * CLAIMS_PER_POLYNOMIAL + claim];
+                                challenge_power *= challenge;
+                                coefficients
+                            })
+                            .collect();
+                        ChunkedCommittedPolyInfo {
+                            num_chunks: CHUNKS,
+                            num_claims: CLAIMS_PER_POLYNOMIAL,
+                            batching_coefficients,
+                        }
+                    })
+                    .collect();
+                let expression = build_sumcheck_expression(infos).unwrap();
+                assert_eq!(
+                    eval_by_expr(&values, &[], &[challenge], &expression),
+                    expected
+                );
+                let expanded = expression.get_monomial_terms();
+                let expanded_value: F = expanded
+                    .iter()
+                    .map(|term| {
+                        eval_by_expr(&values, &[], &[challenge], &term.scalar)
+                            * term
+                                .product
+                                .iter()
+                                .map(|factor| eval_by_expr(&values, &[], &[challenge], factor))
+                                .product::<F>()
+                    })
+                    .sum();
+                assert_eq!(expanded_value, expected);
+                // Both the tree and its expansion are also dropped on this
+                // restricted stack, covering recursive expression destruction.
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_opening_expression_rejects_invalid_counts() {
+        use super::{ChunkedCommittedPolyInfo, build_sumcheck_expression};
+
+        let empty = build_sumcheck_expression::<F>(vec![]).unwrap();
+        assert_eq!(empty, Expression::ZERO);
+        for info in [
+            ChunkedCommittedPolyInfo {
+                num_chunks: 1,
+                num_claims: 2,
+                batching_coefficients: vec![vec![F::ONE]],
+            },
+            ChunkedCommittedPolyInfo {
+                num_chunks: 2,
+                num_claims: 1,
+                batching_coefficients: vec![vec![F::ONE]],
+            },
+            ChunkedCommittedPolyInfo {
+                num_chunks: usize::from(u16::MAX),
+                num_claims: 1,
+                batching_coefficients: vec![vec![F::ONE]],
+            },
+            ChunkedCommittedPolyInfo {
+                num_chunks: usize::MAX,
+                num_claims: 0,
+                batching_coefficients: vec![],
+            },
+        ] {
+            assert!(build_sumcheck_expression(vec![info]).is_err());
+        }
+    }
 
     #[rstest]
     #[case::no_chunked_committed_polys(false)]

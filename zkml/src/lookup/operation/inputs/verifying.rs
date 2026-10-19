@@ -42,13 +42,16 @@ impl LookupInputConfig {
                 ..
             } => {
                 if normalised_sum_value.is_none() {
-                    vec![LogUpVerifierInstance::<F>::new(
-                        shift_check_constant_challenge,
-                        shift_check_column_sep,
-                        shift_table.num_columns(),
-                        ProofType::Lookup,
-                        norm_vars - 1,
-                    )]
+                    vec![
+                        LogUpVerifierInstance::<F>::new(
+                            shift_check_constant_challenge,
+                            shift_check_column_sep,
+                            shift_table.num_columns(),
+                            ProofType::Lookup,
+                            norm_vars.saturating_sub(1).max(1),
+                        );
+                        self.variant.norm_lookups_per_chunk()
+                    ]
                 } else {
                     vec![
                         LogUpVerifierInstance::<F>::new(

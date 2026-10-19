@@ -24,7 +24,7 @@ impl RMSNorm<f32> {
 
         if quantised_alpha.is_some() {
             let intermediate_bit_size =
-                normalisation_scaling_factor.bit_size() + alpha_bit_size + 1;
+                normalisation_scaling_factor.bit_size() + alpha_bit_size + 2;
             let multiplier =
                 alpha_scaling * normalisation_scaling_factor.scale() / output_scaling.scale();
             let requant =

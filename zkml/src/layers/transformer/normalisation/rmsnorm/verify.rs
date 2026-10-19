@@ -16,25 +16,27 @@ pub(crate) struct RMSNormLookupVerifier {
 }
 
 impl RMSNormLookupVerifier {
-    fn new<F, PCS>(ctx: &RMSNormCtx, proof: &RMSNormProof<F, PCS>) -> Self
+    fn new<F, PCS>(ctx: &RMSNormCtx, proof: &RMSNormProof<F, PCS>) -> Result<Self>
     where
         F: PrimeField,
         PCS: CommitmentScheme,
     {
         let intermediate_bit_size = ctx.input_scaling.bit_size() + 1;
-        let normalisation_sum_sq = (ctx.normalisation_dim_size as f32
-            / (ctx.normalisation_scaling.scale().powi(2)))
-        .round_ties_even() as Element;
-        let error_bound = (ctx.normalisation_dim_size as f32
-            * (2.0f32 * ctx.normalisation_scaling.scale().recip() + 1.0f32))
-            .round_ties_even() as Element;
-        RMSNormLookupVerifier {
+        let (normalisation_sum_sq, error_bound) = bounds::norm_parameters(
+            ctx.normalisation_dim_size,
+            ctx.normalisation_scaling.scale(),
+        )?;
+        ensure!(
+            (1..63).contains(&proof.right_shift),
+            "Invalid RMSNorm proof right shift"
+        );
+        Ok(RMSNormLookupVerifier {
             right_shift: proof.right_shift,
             normalisation_sum_sq,
             error_bound,
             intermediate_bit_size,
             has_weight: ctx.alpha_key.is_some(),
-        }
+        })
     }
 
     pub(crate) fn new_from_parts(
@@ -73,7 +75,29 @@ impl LookupOp for RMSNormLookupVerifier {
     }
 
     fn chunking_info(&self, table: &Table) -> Result<ChunkingInfo> {
-        let max_bit_size = self.intermediate_bit_size + FIXED_POINT_SCALE;
+        ensure!(
+            (1..63).contains(&self.right_shift),
+            "Invalid RMSNorm right shift"
+        );
+        // Appendix C relates a rounded positive multiple to its squared norm.
+        // Saturation would invalidate that inference. The guard-bit table puts
+        // either clamping endpoint outside the accepted sphere, so a clamped
+        // coordinate cannot occur in an accepted norm proof.
+        let endpoint = i128::from(table.max_output_value())
+            .abs()
+            .min(i128::from(table.min_output_value()).abs());
+        ensure!(
+            endpoint * endpoint
+                > i128::from(self.normalisation_sum_sq) + i128::from(self.error_bound),
+            "RMSNorm table needs a guard bit to exclude saturation"
+        );
+        // The normalized row bounds every coordinate, independent of the
+        // input's calibration scale. One guard/zeroing chunk suffices.
+        let max_bit_size = self.right_shift() + table.table_bit_size() + 1;
+        ensure!(
+            max_bit_size <= 63,
+            "RMSNorm fixed-point decomposition exceeds i64"
+        );
         ChunkingInfo::new(self.right_shift(), table, max_bit_size, 1)
     }
 
@@ -125,7 +149,10 @@ impl RMSNormCtx {
         T: Transcript,
     {
         // First we make the lookup verifier context
-        let lookup_op = RMSNormLookupVerifier::new(self, proof);
+        let lookup_op = RMSNormLookupVerifier::new(self, proof)?;
+        verifier
+            .transcript
+            .append_scalars(&[F::from(lookup_op.right_shift() as u64)]);
         let RMSNormProof {
             logup_proof,
             commitments,
@@ -145,7 +172,7 @@ impl RMSNormCtx {
         };
 
         let normalisation_scaling_factor = self.normalisation_scaling();
-        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 1);
+        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 2);
 
         let LookupVerifyResult {
             input_claims,

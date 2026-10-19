@@ -1,49 +1,33 @@
-use crate::parser::{
-    Load,
-    llm::{HFTokenizer, LLMMetadata, models::LLMModelLoader, tokenizer::TokenizerLoader},
-};
-use anyhow::Context;
-
 use crate::{
-    Shape,
-    layers::transformer::attention_mask::AttentionSpan,
     model::Model,
     parser::{
         ModelLoader,
-        llm::{
-            LLMConfig, LLMIR,
-            config::{AttentionConfig, AttentionHeadType, LLMStructure},
-            transformer::NormType,
-        },
-        safe::{self, RawSafeTensors},
+        llm::{HFTokenizer, LLMMetadata, models::LLMModelLoader, tokenizer::TokenizerLoader},
+        safe::RawSafeTensors,
     },
 };
 
 pub mod decoder;
-use decoder::Llama2Decoder;
 
-/// Loader for the Llama2 model.
+/// Loader for Hugging Face Llama 2 models.
 #[derive(Clone, Debug, Default, Copy)]
 pub struct Llama2 {
-    /// Maximum context length for RoPE precomputation.
-    /// If None, uses the model's default from config.json.
     max_ctx_length: Option<usize>,
 }
 
 pub const LLAMA2_NAME: &str = "llama2";
 impl Llama2 {
     pub fn new() -> Self {
-        Llama2 {
-            max_ctx_length: None,
-        }
+        Self::default()
     }
 
-    /// Set a custom maximum context length to limit RoPE matrix size.
+    /// Limit the context used to precompute RoPE matrices.
     pub fn with_max_ctx_length(mut self, length: usize) -> Self {
         self.max_ctx_length = Some(length);
         self
     }
 }
+
 pub fn is_llama2_model(names: &[String]) -> bool {
     names
         .iter()
@@ -52,8 +36,7 @@ pub fn is_llama2_model(names: &[String]) -> bool {
 
 impl TokenizerLoader<RawSafeTensors> for Llama2 {
     fn load_tokenizer(&self, raw: &RawSafeTensors) -> anyhow::Result<HFTokenizer> {
-        let tokenizer = HFTokenizer::from_tokenizer_json_path(raw.tokenizer_path())?;
-        Ok(tokenizer)
+        HFTokenizer::from_tokenizer_json_path(raw.tokenizer_path())
     }
 }
 
@@ -61,13 +44,8 @@ impl<DataFormat> LLMModelLoader<DataFormat> for Llama2
 where
     Llama2: ModelLoader<DataFormat, Metadata = LLMMetadata>,
 {
-    fn with_max_context_length(self, max_ctx_length: usize) -> Self
-    where
-        Self: Sized,
-    {
-        Llama2 {
-            max_ctx_length: Some(max_ctx_length),
-        }
+    fn with_max_context_length(self, length: usize) -> Self {
+        self.with_max_ctx_length(length)
     }
 }
 
@@ -75,77 +53,11 @@ impl ModelLoader<RawSafeTensors> for Llama2 {
     type Metadata = LLMMetadata;
 
     fn model_name(&self) -> String {
-        LLAMA2_NAME.to_string()
+        LLAMA2_NAME.to_owned()
     }
 
     fn parse(&self, raw: &RawSafeTensors) -> anyhow::Result<(Model<f32>, Self::Metadata)> {
-        // Read HF config.json
-        let cfg = raw.read_config_json()?;
-        let hidden_size = cfg
-            .get::<usize, _>("hidden_size")
-            .context("hidden_size not found")?;
-        let embedding_size = hidden_size;
-        let num_heads = cfg
-            .get::<usize, _>("num_attention_heads")
-            .context("num_attention_heads not found")?;
-        // head_dim may not be present in config.json, compute from hidden_size / num_heads
-        let head_size = cfg
-            .get::<usize, _>("head_dim")
-            .unwrap_or(hidden_size / num_heads);
-        let num_block = cfg
-            .get::<usize, _>("num_hidden_layers")
-            .context("num_hidden_layers not found")?;
-        let config_context_length = cfg
-            .get::<usize, _>("max_position_embeddings")
-            .context("max_position_embeddings not found")?;
-        // Use custom max_ctx_length if set (to limit RoPE matrix size), otherwise use config value
-        let context_length = self.max_ctx_length.unwrap_or(config_context_length);
-        let norm_epsilon = cfg
-            .get::<f32, _>("rms_norm_eps")
-            .context("rms_norm_eps not found")?;
-        let vocab_size = cfg
-            .get::<usize, _>("vocab_size")
-            .context("vocab_size not found")?;
-        let eos_token = cfg
-            .get::<u64, _>("eos_token_id")
-            .context("eos_token_id not found")?
-            .into();
-        let intermediate_size = cfg
-            .get::<usize, _>("intermediate_size")
-            .context("intermediate_size not found")?;
-
-        let llm_config = LLMConfig {
-            model_name: "llama2".to_string(),
-            embedding_size,
-            hidden_size,
-            intermediate_size,
-            num_heads,
-            head_size,
-            num_block,
-            context_length,
-            norm_epsilon,
-            vocab_size,
-            eos_token,
-        };
-
-        // Structure: Llama2 uses RMSNorm + RoPE and no final projection
-        let num_groups = cfg
-            .get::<usize, _>("num_key_value_heads")
-            .context("num_key_value_heads not found")?;
-        let structure = LLMStructure {
-            generic: llm_config.clone(),
-            norm_type: NormType::RMSNorm,
-            global_positional: None,
-            attention_config: AttentionConfig {
-                span: (1..=num_block).map(|_| AttentionSpan::Full).collect(),
-                head: AttentionHeadType::GQA(num_groups),
-            },
-        };
-
-        let loader = safe::FileTensorLoader::from_path(raw.model_path())?;
-        let llm_model = LLMIR::<Llama2Decoder>::from_loader(&loader, &(structure, cfg))?;
-        let init_user_shape = Shape::from(vec![1]);
-        llm_model.into_model(llm_config, init_user_shape)
+        super::llama::parse(raw, self.max_ctx_length, LLAMA2_NAME)
     }
 }
 
@@ -156,7 +68,7 @@ pub mod tests {
     use serde::{Deserialize, Serialize};
     use tenstore::GenStore;
 
-    use crate::{Tensor, layers::Layer, parser::llm::LLMTokenizer};
+    use crate::{Shape, Tensor, layers::Layer, parser::llm::LLMTokenizer};
 
     use super::*;
 

@@ -33,8 +33,11 @@ impl RMSNorm<Element> {
         let (_, normalisation_scaling_factor) = self.get_quantisation_scaling_factors().ok_or(
             anyhow!("Quantisation scaling factors not found for RMSNorm lookup witness generation"),
         )?;
-        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 1);
+        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 2);
 
+        prover
+            .transcript
+            .append_scalars(&[F::from(lookup_op.right_shift() as u64)]);
         let LookupProverResult {
             generic_proof,
             input_claims,

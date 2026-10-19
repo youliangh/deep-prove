@@ -54,6 +54,32 @@ impl LookupVariant {
                 normalised_sum_value,
                 ..
             } => {
+                if normalised_sum_value.is_none() {
+                    // Both residuals and the positive multiplier are unsigned
+                    // limb integers. Their sums must not wrap modulo the field.
+                    ensure!(
+                        F::MODULUS_BIT_SIZE > 49,
+                        "RMSNorm requires a field larger than 49 bits"
+                    );
+                    let limbs = rms::residual_limbs(*magnitude_error_bound)?;
+                    ensure!(
+                        evals.len() == 2 * limbs + rms::RMS_MULTIPLIER_LIMBS,
+                        "Incorrect RMSNorm limb evaluation count"
+                    );
+                    let upper = rms::recompose(&evals[..limbs]);
+                    let lower = rms::recompose(&evals[limbs..2 * limbs]);
+                    let twice_bound: F = (2 * *magnitude_error_bound).to_field();
+                    ensure!(
+                        upper + lower == lt_eval * twice_bound,
+                        "RMSNorm complementary residuals do not sum to twice the error bound"
+                    );
+                    let upper_target: F =
+                        (*normalised_magnitude_value + *magnitude_error_bound).to_field();
+                    return Ok(vec![
+                        lt_eval * upper_target - upper,
+                        rms::recompose(&evals[2 * limbs..]),
+                    ]);
+                }
                 // If there is no norm sum we just set these to zero (we won't use the values calculated for these if there is no normalised sum value)
                 let (norm_sum, sum_error_bound) = match normalised_sum_value {
                     Some((v, e)) => (*v, *e),
@@ -238,17 +264,19 @@ impl LookupVariant {
     }
 
     /// Internal method to get the number of normalisation lookups per chunk for this variant.
-    fn norm_lookups_per_chunk(&self) -> usize {
+    pub(crate) fn norm_lookups_per_chunk(&self) -> usize {
         match self {
             LookupVariant::Standard | LookupVariant::GLU => 0,
             LookupVariant::Softmax { .. } => 1,
             LookupVariant::Normalisation {
                 normalised_sum_value,
+                magnitude_error_bound,
                 ..
             } => {
                 if normalised_sum_value.is_none() {
-                    // In this case we only have to check the sum of squares so we only have one check per chunk
-                    1
+                    2 * rms::residual_limbs(*magnitude_error_bound)
+                        .expect("Validated RMSNorm error bound")
+                        + rms::RMS_MULTIPLIER_LIMBS
                 } else {
                     // have to check both the sum and the sum of squares so we have two checks per chunk
                     2

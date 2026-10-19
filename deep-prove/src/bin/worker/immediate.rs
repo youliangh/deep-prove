@@ -12,9 +12,9 @@ use tempfile::Builder;
 use tenstore::GenStore;
 use tracing::info;
 use zkml::{
-    Element, Number,
+    Element,
     inputs::Input,
-    model::llm::{Driver, LLMProof, WithMaxContext},
+    model::llm::{Driver, LLMProof, WithMaxContext, generation_context_length},
     parser::{
         ModelLoader, ModelNameProvider,
         gguf::RawGGUF,
@@ -24,6 +24,7 @@ use zkml::{
             models::{
                 gemma3::Gemma3,
                 gpt2::{GPT2, is_gpt2_model},
+                llama3::Llama3,
             },
             tokenizer::{HFTokenizer, TokenizerLoader},
         },
@@ -163,20 +164,10 @@ async fn run_one_shot_llm(
 
     let input_tensor = driver.tokens_to_tensor(&user_tokens)?;
     let trace = driver.run_elements(input_tensor, &mut tenstore)?;
-    let (proof, io) = driver.prove(&prover_ctx, trace.clone())?;
+    let final_tokens = driver.continuation_tokens(&trace, user_tokens.len())?;
+    let (proof, io) = driver.prove(&prover_ctx, trace)?;
+    verifier_ctx.verify(proof.clone(), user_tokens.clone(), io.clone())?;
     let llm_proof = LLMProof { proof, io };
-
-    let final_tokens = trace
-        .outputs()
-        .last()
-        .and_then(|h| h.tensor().ok())
-        .map(|t| {
-            t.data()
-                .iter()
-                .map(|x| Token::from(x.to_usize()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let llm_response = tokenizer.detokenize(&final_tokens);
 
     info!("LLM response: {}", llm_response);
@@ -242,8 +233,20 @@ fn load_llm_artifacts(
                 config_path.expect("config"),
             );
             let model_names = raw.model_metadata()?;
-            let (driver, tokenizer, user_tokens) =
-                build_driver_from_names(model_names.clone(), raw, prompt, max_new_tokens)?;
+            let (driver, tokenizer, user_tokens) = if model_names
+                .iter()
+                .any(|name| name.to_lowercase().contains("llama"))
+            {
+                let tokenizer = Llama3::new().load_tokenizer(&raw)?;
+                let tokens = tokenizer.tokenize(&prompt);
+                let context = generation_context_length(tokens.len(), max_new_tokens)?;
+                let driver = Driver::load_from_model(Llama3::new(), &raw, Some(context))?;
+                let (driver, _) =
+                    zkml::quantization::llm_quant::llama3::quantize(driver, &tokenizer, None)?;
+                (driver, tokenizer, tokens)
+            } else {
+                build_driver_from_names(model_names.clone(), raw, prompt, max_new_tokens)?
+            };
             (model_names, user_tokens, tokenizer, driver)
         }
     };
@@ -252,7 +255,7 @@ fn load_llm_artifacts(
         .first()
         .cloned()
         .unwrap_or_else(|| "unknown".to_string());
-    let max_context = tokens.len() + max_new_tokens;
+    let max_context = generation_context_length(tokens.len(), max_new_tokens)?;
 
     Ok(LlmArtifacts {
         driver,
@@ -280,7 +283,7 @@ where
         DetectedModel::Gpt2 => {
             let tokenizer = GPT2::new().load_tokenizer(&raw)?;
             let user_tokens = tokenizer.tokenize(&prompt);
-            let max_context = user_tokens.len() + max_new_tokens;
+            let max_context = generation_context_length(user_tokens.len(), max_new_tokens)?;
             let driver = Driver::load_from_model(GPT2::new(), &raw, Some(max_context))?
                 .into_provable_llm(None)?
                 .0;
@@ -289,7 +292,7 @@ where
         DetectedModel::Gemma3 => {
             let tokenizer = Gemma3::new().load_tokenizer(&raw)?;
             let user_tokens = tokenizer.tokenize(&prompt);
-            let max_context = user_tokens.len() + max_new_tokens;
+            let max_context = generation_context_length(user_tokens.len(), max_new_tokens)?;
             let driver = Driver::load_from_model(Gemma3::new(), &raw, Some(max_context))?
                 .into_provable_llm(None)?
                 .0;

@@ -239,6 +239,29 @@ pub struct AddQuantInfo {
 }
 
 impl AddQuantInfo {
+    fn scaled_sum_bit_size(
+        left_multiplier: Element,
+        left_input_bits: usize,
+        right_multiplier: Element,
+        right_input_bits: usize,
+    ) -> usize {
+        let product_bits = |multiplier: Element, input_bits| {
+            if multiplier == 0 {
+                0
+            } else {
+                ceil_log2(multiplier.unsigned_abs() as usize) + input_bits
+            }
+        };
+        // Pair each multiplier with its own input. Combining the largest
+        // multiplier with the widest *other* input can erase that branch when
+        // the common fixed-point multipliers are shifted down to fit i64.
+        let max_product_bits = product_bits(left_multiplier, left_input_bits)
+            .max(product_bits(right_multiplier, right_input_bits));
+        // Preserve the addition/sign margin and the bookkeeping floor used by
+        // requant_from_add when it removes FIXED_POINT_SCALE from this bound.
+        (max_product_bits + 2).max(FIXED_POINT_SCALE)
+    }
+
     pub fn new(
         left_scaling: &ScalingFactor,
         right_scaling: &ScalingFactor,
@@ -313,18 +336,27 @@ impl AddQuantInfo {
             };
 
         // Now we need to make sure we can actually perform the requantisation, if not we sacrifice some accuracy to make it possible
-        let max_multiplier = std::cmp::max(left_multiplier, right_multiplier);
-        let max_mult_bit_size = ceil_log2(max_multiplier as usize);
         let lhs_input_bit_size = left_scaling.bit_size();
         let rhs_input_bit_size = right_scaling.bit_size();
-        let max_input_bit_size = std::cmp::max(lhs_input_bit_size, rhs_input_bit_size);
-        let mut total_bit_size = max_mult_bit_size + max_input_bit_size + 2; // +1 for the addition of left and right and an additional + 1 for the sign
+        let mut total_bit_size = Self::scaled_sum_bit_size(
+            left_multiplier,
+            lhs_input_bit_size,
+            right_multiplier,
+            rhs_input_bit_size,
+        );
 
         while total_bit_size >= 63 {
-            total_bit_size -= 1;
-            final_right_shift -= 1;
+            final_right_shift = final_right_shift
+                .checked_sub(1)
+                .expect("Add scaling cannot fit i64 without a negative right shift");
             left_multiplier >>= 1;
             right_multiplier >>= 1;
+            total_bit_size = Self::scaled_sum_bit_size(
+                left_multiplier,
+                lhs_input_bit_size,
+                right_multiplier,
+                rhs_input_bit_size,
+            );
         }
 
         Self {
@@ -627,6 +659,77 @@ mod test {
             model.describe();
             prove_model(model, &mut GenStore::default()).unwrap();
         }
+    }
+
+    #[test]
+    fn mixed_width_residual_keeps_both_branches_and_proves() -> anyhow::Result<()> {
+        assert_eq!(*quantization::BIT_LEN, 12);
+        // Frozen Llama3 block-2 scales after retaining 24-bit GLU output.
+        // The right input is a 48-bit unrequantized down projection, while the
+        // left residual is 24-bit. The old max(multiplier)+max(input) bound
+        // shifted the right multiplier to zero for these concrete scales.
+        let residual_domain = (-(1i64 << 23), (1i64 << 23) - 1);
+        let down_domain = (-(1i64 << 47), (1i64 << 47) - 1);
+        let left_sf = ScalingFactor::from_scale(2.5950814e-5, Some(residual_domain));
+        let right_sf =
+            ScalingFactor::from_scale(3.159912e-7 * (4095.0 / 16777215.0), Some(down_domain));
+        let output_sf = ScalingFactor::from_scale(2.5980135e-5, Some(residual_domain));
+        let info = AddQuantInfo::new(&left_sf, &right_sf, &output_sf);
+        assert!(info.left_scale() > 0 && info.right_scale() > 0);
+        assert!(info.intermediate_bit_size() < 63);
+        let rounding = 1i128 << (info.right_shift() - 1);
+        for left in [residual_domain.0, residual_domain.1] {
+            for right in [down_domain.0, down_domain.1] {
+                let result = i128::from(left) * i128::from(info.left_scale())
+                    + i128::from(right) * i128::from(info.right_scale())
+                    + rounding;
+                assert!((i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&result));
+            }
+        }
+
+        let shape: Shape = vec![2, 4].into();
+        let left = Tensor::new(
+            shape.clone(),
+            vec![1.0f32, -1.0, 0.0, 0.0, 0.25, -0.25, 0.0, 0.0],
+        )?
+        .quantize(&left_sf);
+        let right = Tensor::new(
+            shape.clone(),
+            vec![0.5f32, -0.5, 1.0, -1.0, 0.0, 0.0, 1e6, -1e6],
+        )?
+        .quantize(&right_sf);
+        let expected = left.dequantize(&left_sf).add(&right.dequantize(&right_sf));
+        let quantized = Add::<f32>::new().quantize(&[left_sf, right_sf], output_sf)?;
+        let mut model = Model::<Element>::new_from_input_shapes(vec![shape.clone(), shape]);
+        let add_id = model.add_consecutive_layer(Layer::Add(quantized.quantized_op), None)?;
+        model.add_consecutive_layer(
+            Layer::Requant(quantized.requant_layer.unwrap()[0]),
+            Some(add_id),
+        )?;
+        model.automatic_output_labelling()?;
+        // Runs Add + Requant, generates its full proof, and verifies it.
+        let output = crate::model::test::prove_quantized_model(
+            model,
+            vec![left, right],
+            &mut GenStore::default(),
+        )?;
+        let output = output[0].tensor()?;
+        for (actual, expected) in output.data()[..6].iter().zip(expected.data()) {
+            assert!((output_sf.dequantize(actual) - expected).abs() < 0.001);
+        }
+        assert_eq!(output.data()[6], residual_domain.1);
+        assert_eq!(output.data()[7], residual_domain.0);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_multiplier_does_not_inherit_the_unused_input_width() {
+        assert_eq!(AddQuantInfo::scaled_sum_bit_size(0, 60, 1 << 15, 11), 28);
+        assert_eq!(AddQuantInfo::scaled_sum_bit_size(1 << 15, 11, 0, 60), 28);
+        assert_eq!(
+            AddQuantInfo::scaled_sum_bit_size(0, 60, 0, 60),
+            FIXED_POINT_SCALE
+        );
     }
 
     proptest! {

@@ -55,6 +55,7 @@ impl LookupInputConfig {
         &self,
         mles: &[Arc<DensePolynomial<F>>],
         output: Option<&Tensor<Element>>,
+        normalisers: Option<&[Arc<DensePolynomial<F>>]>,
         challenge_storage: &ChallengeStorage<F>,
     ) -> Result<Vec<LogUpInput<F>>> {
         let chunking_info = &self.chunking_info;
@@ -252,6 +253,49 @@ impl LookupInputConfig {
                 shift_column_sep,
             )?;
             logup_inputs.extend(normalisation_inputs);
+        }
+        if self.variant.is_rmsnorm() {
+            use super::variant::rms::{RMS_MULTIPLIER_LIMBS, decompose};
+            let normalisers = normalisers.ok_or(anyhow!("Missing RMSNorm multiplier witnesses"))?;
+            ensure!(
+                normalisers.len() == number_of_chunks,
+                "Wrong RMSNorm multiplier chunk count"
+            );
+            let mut columns = vec![Vec::new(); RMS_MULTIPLIER_LIMBS * number_of_chunks];
+            for (chunk, poly) in normalisers.iter().enumerate() {
+                for value in poly.evals_ref() {
+                    let integer = value.into_bigint();
+                    let words = integer.as_ref();
+                    ensure!(
+                        words.iter().skip(1).all(|&word| word == 0),
+                        "Negative or oversized RMSNorm multiplier"
+                    );
+                    let value = Element::try_from(words[0])?;
+                    for (limb, value) in decompose(value, RMS_MULTIPLIER_LIMBS)?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        columns[limb * number_of_chunks + chunk].push(value.to_field());
+                    }
+                }
+            }
+            for column in &mut columns {
+                let copies = 4 / column.len().min(4);
+                if copies > 1 {
+                    *column = column
+                        .iter()
+                        .flat_map(|value| std::iter::repeat_n(*value, copies))
+                        .collect();
+                }
+            }
+            for columns in columns.chunks(number_of_chunks) {
+                logup_inputs.push(LogUpInput::<F>::new_lookup(
+                    columns.to_vec(),
+                    constant_challenge,
+                    shift_column_sep,
+                    1,
+                )?);
+            }
         }
 
         Ok(logup_inputs)

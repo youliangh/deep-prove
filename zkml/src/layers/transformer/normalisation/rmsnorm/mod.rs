@@ -23,7 +23,7 @@ use crate::{
     },
     lookup::{
         operation::{LookupOp, decomposer::ChunkingInfo, variant::LookupVariant},
-        table::{SHIFT_CHECK_TABLE_BIT_SIZE, Table},
+        table::Table,
     },
     padding::PaddingMode,
     poly_commit::verifier::VerifierCommitment,
@@ -31,6 +31,7 @@ use crate::{
     tensor::{CommitmentId, TensorTypeParam},
 };
 
+mod bounds;
 pub mod evaluate;
 mod lookup;
 pub mod prove;
@@ -128,7 +129,7 @@ impl RMSNormCtx {
     pub fn lookup_tables(&self) -> Vec<Table> {
         vec![
             Table::new_shift_check(),
-            Table::new_normalisation(self.normalisation_scaling().bit_size() + 1),
+            Table::new_normalisation(self.normalisation_scaling().bit_size() + 2),
             Table::new_signed_zero_check(),
         ]
     }
@@ -449,34 +450,8 @@ impl QuantizeOp for RMSNorm<f32> {
 
         let input_scaling_factor = input_scaling[0];
 
-        // We want to calculate the largest quantisation domain that will allow us to fit the magnitude normalisation check into
-        // a single shift check table. This means we need twice the error bound to have a bit length <= SHIFT_CHECK_TABLE_BIT_SIZE.
-        // The error bound is normalisation_dim_size * (1.0 / normalisation_scaling_factor + 0.25) so we can rearrange to find the normalisation_scaling_factor that will allow us to fit into the table.
-        // The rearrangement gives us (2^SHIFT_CHECK_TABLE_BIT_SIZE / normalisation_dim_size) - 0.25 >= 1.0 / normalisation_scaling_factor, so normalisation_scaling_factor >= 1.0 / ((2^SHIFT_CHECK_TABLE_BIT_SIZE / normalisation_dim_size) - 0.25).
-        let minimum_normalising_scale = 2.0
-            / ((1u64 << (SHIFT_CHECK_TABLE_BIT_SIZE - 1)) as f32
-                / self.normalisation_dim_size as f32
-                - 1.0);
-
-        // The scale is calculated as (float_max - float_min) / (quant_max - quant_min)
-        let mut normalisation_bits = *quantization::BIT_LEN;
-        let norm_max = (self.normalisation_dim_size() as f32).sqrt();
-        let norm_min = -norm_max;
-
-        let mut test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-        while test_scale < minimum_normalising_scale && normalisation_bits > 1 {
-            normalisation_bits -= 1;
-            test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-        }
-
-        let norm_quant_min: Element = -1 << (normalisation_bits - 1);
-        let norm_quant_max: Element = (1 << (normalisation_bits - 1)) - 1;
-        let normalisation_scaling_factor = ScalingFactor::from_parts(
-            norm_max,
-            norm_min,
-            test_scale,
-            (norm_quant_min, norm_quant_max),
-        );
+        let normalisation_scaling_factor =
+            bounds::normalisation_scale(self.normalisation_dim_size(), *quantization::BIT_LEN);
 
         let output_scaling = output_scalings[0];
 
@@ -576,6 +551,32 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_rmsnorm_llama_width_proving() {
+        // Three real rows exercise padding as well as the two-limb residuals
+        // required by the 2048-wide Llama norm at 12-bit precision.
+        let mut model = Model::new_from_input_shapes(vec![Shape::new(vec![3, 2048])]);
+        let norm = RMSNorm::<f32>::new(None, 1e-5, Some(2048)).unwrap();
+        model
+            .add_consecutive_layer(Layer::RMSNorm(norm), None)
+            .unwrap();
+        model.automatic_output_labelling().unwrap();
+        prove_model(model, &mut GenStore::default()).unwrap();
+    }
+
+    #[test]
+    fn test_rmsnorm_single_row_proving() {
+        for rows in [1, 2] {
+            let mut model = Model::new_from_input_shapes(vec![Shape::new(vec![rows, 16])]);
+            let norm = RMSNorm::<f32>::new(None, 1e-5, Some(16)).unwrap();
+            model
+                .add_consecutive_layer(Layer::RMSNorm(norm), None)
+                .unwrap();
+            model.automatic_output_labelling().unwrap();
+            prove_model(model, &mut GenStore::default()).unwrap();
+        }
+    }
 
     #[test]
     fn test_rmsnorm_proving() {

@@ -19,6 +19,7 @@ use dp_crypto::{
 };
 use either::Either;
 use itertools::Itertools;
+use tracing::debug;
 
 use crate::{
     Claim,
@@ -103,12 +104,14 @@ impl<F: PrimeField, PCS: CommitmentScheme> CommitmentProver<F, PCS> {
     where
         PCS: CommitmentScheme<Field = F>,
     {
+        debug!("Opening: starting claims batching");
         let ClaimsBatchingProof {
             sumcheck_proof,
             sumcheck_evals,
             sumcheck_point,
             committed_polys,
         } = self.claims_batching_sumcheck(witness_commitments, ctx, transcript)?;
+        debug!("Opening: finished claims batching");
 
         // Sample the challenges to batch the committed_polys into a single polynomial;
         // Before sampling the challenges, we add all claims to the transcript
@@ -119,9 +122,15 @@ impl<F: PrimeField, PCS: CommitmentScheme> CommitmentProver<F, PCS> {
             .map(|poly| (poly, transcript.challenge_scalar::<F>()))
             .unzip();
 
+        debug!(
+            committed_chunks = committed_polys.len(),
+            "Opening: starting polynomial linear combination"
+        );
         let rlc_poly = DensePolynomial::linear_combination(&committed_polys, &challenges);
+        debug!("Opening: finished polynomial linear combination");
 
         // Make the PCS opening proof
+        debug!("Opening: starting PCS proof");
         let pcs_proof = PCS::prove(
             &ctx.prover_params,
             &rlc_poly,
@@ -129,6 +138,7 @@ impl<F: PrimeField, PCS: CommitmentScheme> CommitmentProver<F, PCS> {
             None,
             transcript,
         )?;
+        debug!("Opening: finished PCS proof");
 
         Ok(OpeningProof {
             sumcheck_proof,
@@ -209,7 +219,17 @@ impl<F: PrimeField, PCS: CommitmentScheme> CommitmentProver<F, PCS> {
             });
         }
 
+        debug!(
+            committed_polynomials = batching_coeffs_per_poly.len(),
+            claims = eq_polys.len(),
+            committed_chunks = committed_polys.len(),
+            eq_polynomials = eq_polys.len(),
+            builder_witnesses = committed_polys.len() + eq_polys.len(),
+            max_num_vars,
+            "Opening: constructing batching expression"
+        );
         let sumcheck_expression = build_sumcheck_expression(batching_coeffs_per_poly)?;
+        debug!("Opening: finished batching expression");
 
         let poly_views = committed_polys
             .iter()
@@ -233,11 +253,19 @@ impl<F: PrimeField, PCS: CommitmentScheme> CommitmentProver<F, PCS> {
         let challenge = transcript.append_and_sample(b"model_batching");
         // Make the VirtualPolynomials and run Sumcheck proving
         let num_threads = optimal_sumcheck_threads(max_num_vars);
+        debug!(
+            builder_witnesses = either_polys.len(),
+            num_threads, "Opening: constructing virtual polynomial builder"
+        );
         let expr_builder =
             VirtualPolynomialsBuilder::<F>::new_with_mles(num_threads, max_num_vars, either_polys);
+        debug!("Opening: expanding expression into virtual polynomials");
         let virtual_poly =
             expr_builder.to_virtual_polys(slice::from_ref(&sumcheck_expression), &[challenge]);
+        debug!("Opening: finished virtual polynomial expansion");
+        debug!("Opening: starting batching sumcheck");
         let (sumcheck_proof, state) = IOPProverState::<F>::prove(virtual_poly, transcript);
+        debug!("Opening: finished batching sumcheck");
         let all_evals = state.get_mle_flatten_final_evaluations();
         let sumcheck_point = state.collect_raw_challenges();
 

@@ -4,16 +4,14 @@ use crate::{
     graph::NodeId,
     layers::{
         Layer,
-        transformer::{
-            attention_mask::AttentionSpan,
-            positional::{Positional, RopeLayout},
-        },
+        transformer::{attention_mask::AttentionSpan, positional::Positional},
     },
     model::Model,
     parser::{
         Load,
         llm::{
-            config::{AttentionHeadType, LLMStructure, PositionalConfig, RopeConfig},
+            config::{AttentionHeadType, LLMStructure},
+            models::llama::load_rope,
             transformer::attention_layer::{AttentionCacheConfig, AttentionMechanism},
         },
         safe::{ConfigJSON, FileTensorLoader as SafeLoader},
@@ -21,7 +19,7 @@ use crate::{
     tensor::{Tensor, TensorHandle},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 #[derive(Clone, Debug)]
 pub struct Llama2Attention {
@@ -231,14 +229,6 @@ impl Load<SafeLoader> for Llama2Attention {
                 Tensor::new(wo_reshape.clone().into(), permuted)
             })?;
 
-        let positional_config = PositionalConfig::Rope(RopeConfig {
-            base_frequency: config
-                .get::<f32, _>("rope_theta")
-                .context("rope_theta not found")?,
-            max_seq_length: max_ctx_length,
-            layout: RopeLayout::RotateHalf,
-        });
-
         Ok(Self {
             max_context_length: structure.generic.context_length,
             num_heads,
@@ -249,7 +239,7 @@ impl Load<SafeLoader> for Llama2Attention {
             wv: wv.into(),
             wo: wo.into(),
             span: AttentionSpan::Full, // Llama2 always uses full attention
-            rope: Positional::from_safetensors_loader(loader, structure, &positional_config)?,
+            rope: load_rope(config, head_size, max_ctx_length)?,
         })
     }
 }

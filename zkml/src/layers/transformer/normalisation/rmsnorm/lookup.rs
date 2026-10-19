@@ -25,7 +25,7 @@ impl RMSNorm<Element> {
         let (_, normalisation_scaling_factor) = self.get_quantisation_scaling_factors().ok_or(
             anyhow!("Quantisation scaling factors not found for RMSNorm lookup witness generation"),
         )?;
-        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 1);
+        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 2);
 
         let wrapped_input = WrappedTensor::try_from(input.as_ref())?;
         let lookup_output = rmsnorm_data.apply(wrapped_input.clone(), &table)?;
@@ -51,6 +51,22 @@ impl RMSNorm<Element> {
         for (key, val) in norm_map {
             let entry = element_counts[0].entry(key).or_insert(0);
             *entry += val;
+        }
+
+        // Range-check the very same multiplier witness committed below. Zero
+        // padding is included in both these counts and the LogUp columns.
+        use crate::lookup::operation::variant::rms::{RMS_MULTIPLIER_LIMBS, decompose};
+        let rows = if rank >= 2 { input_shape[rank - 2] } else { 1 };
+        for chunk in rmsnorm_data.normalisation.get_data().chunks(rows) {
+            for value in chunk.iter().copied().chain(std::iter::repeat_n(
+                0,
+                rows.next_power_of_two() - chunk.len(),
+            )) {
+                for limb in decompose(value, RMS_MULTIPLIER_LIMBS)? {
+                    *element_counts[0].entry(limb).or_insert(0) +=
+                        (4 / rows.next_power_of_two().min(4)) as u64;
+                }
+            }
         }
 
         let input_evals = lookup_witness.input_mle_evals::<F>(table.num_columns());

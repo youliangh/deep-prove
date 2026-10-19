@@ -126,6 +126,32 @@ impl<T> Tensor<T> {
         &self.data
     }
 
+    /// Validate dimensions received through serialization before indexing them.
+    pub(crate) fn validate_shape(&self) -> Result<()> {
+        ensure!(!self.shape.is_empty(), "Tensor shape must not be empty");
+        ensure!(
+            self.shape.rank() == self.unpadded_shape.rank(),
+            "Padded and unpadded tensor ranks differ"
+        );
+        let size = self.shape.iter().try_fold(1usize, |size, &dim| {
+            ensure!(dim > 0, "Tensor dimensions must be positive");
+            size.checked_mul(dim)
+                .ok_or_else(|| anyhow::anyhow!("Tensor dimensions overflow"))
+        })?;
+        ensure!(
+            size == self.data.len(),
+            "Tensor shape does not match data length"
+        );
+        ensure!(
+            self.unpadded_shape
+                .iter()
+                .zip(self.shape.iter())
+                .all(|(&actual, &padded)| actual > 0 && actual <= padded),
+            "Invalid unpadded tensor dimensions"
+        );
+        Ok(())
+    }
+
     /// Returns a reference to the tensor's [Shape].
     pub fn shape(&self) -> &Shape {
         assert!(!self.shape.is_empty(), "Empty tensor");

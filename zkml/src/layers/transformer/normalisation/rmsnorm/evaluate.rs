@@ -96,80 +96,78 @@ impl RMSNorm<Element> {
             .get_quantisation_scaling_factors()
             .context("Quantisation scaling factors not found for RMSNorm evaluation")?;
 
-        let squared = input.clone().mul(input.clone())?;
-        let summed = squared.sum_dim(-1);
-
-        // ── Why we don't use epsilon in the quantised path ─────────────────────
-        //
-        // Standard (float) RMSNorm computes:
-        //   output = input / sqrt(mean(input²) + eps)
-        //
-        // The ZK prover verifies each row satisfies:
-        //   sum(output²) ≈ normalised_sum_sq  (within ± error_bound)
-        // If the check value lands outside ShiftCheckTable's [0, 65535] range,
-        // the prover fails with "Final numerator was non-zero".
-        //
-        // Problem: epsilon in sqrt(mean_sq + eps) inflates the denominator,
-        // which shrinks the normalising factor, which shrinks the outputs,
-        // which makes sum(output²) too small, which overflows the check table.
-        // This is especially severe for rows with small input magnitudes where
-        // eps is significant relative to mean(input²) (e.g. Llama2 RMSNorm).
-        //
-        // Fix: don't use epsilon here at all. Its only purpose in float
-        // RMSNorm is to prevent division by zero, which we handle explicitly
-        // via the `input_sumsq != 0` branch below. Instead, compute the
-        // normalising factor directly from the target output sum-of-squares:
-        //
-        //   nws = sqrt(normalised_sum_sq / input_sumsq)
-        //
-        // This guarantees sum(output²) ≈ normalised_sum_sq (targeting the
-        // center of the valid range to leave margin for fixed-point rounding).
-        //
-        // Note on zero-input rows:
-        //   If input_sumsq == 0 we set nws = 0 to avoid log2(0) = -inf in
-        //   the fract/shift decomposition below. Output will be all zeros.
-        //   In practice zero rows don't occur (quantisation spreads values).
-        // ───────────────────────────────────────────────────────────────────────
-
-        let input_sumsq_data: Vec<Element> = summed.get_data();
-        let multiplier_shape = summed.shape();
-
-        // Normalisation check parameters (same formula used by the prover/verifier
-        // in variant/proving.rs and variant/verifying.rs).
-        let normalised_sum_sq = (self.normalisation_dim_size() as f32
-            / (normalisation_scaling_factor.scale() * normalisation_scaling_factor.scale()))
-        .round_ties_even() as Element;
-        let error_bound = (self.normalisation_dim_size() as f32
-            * (2.0f32 * normalisation_scaling_factor.scale().recip() + 1.0f32))
-            .round_ties_even() as Element;
-
-        let target_sumsq = normalised_sum_sq as f32;
+        // Appendix C normalizes the nonzero row to a fixed squared norm; it
+        // does not include the Hugging Face epsilon. Float evaluation above
+        // retains that epsilon, allowing this numerical difference to be measured.
+        let (normalised_sum_sq, error_bound) = bounds::norm_parameters(
+            self.normalisation_dim_size(),
+            normalisation_scaling_factor.scale(),
+        )?;
+        ensure!(
+            input.unpadded_shape()[shape.rank() - 1] == self.normalisation_dim_size(),
+            "RMSNorm dimension mismatch"
+        );
+        let row_width = input.dim(-1)?;
+        let input_data = input.get_data();
+        let multiplier_shape = shape
+            .iter()
+            .copied()
+            .take(shape.rank() - 1)
+            .chain([1])
+            .collect::<Vec<_>>();
         let mut cache = self.cache.lock().unwrap();
-        let (mut fract_data, shift_data) = input_sumsq_data.iter().map(|&input_sumsq| {
-            if input_sumsq != 0 {
-                let nws = (target_sumsq / input_sumsq as f32).sqrt();
-                let log_x = nws.log2();
-                let fract_mul = (2.0f32.powf(log_x.fract()) * (1u64 << FIXED_POINT_SCALE) as f32).round_ties_even() as Element;
-                let shift_amount = log_x.trunc() as Element - FIXED_POINT_SCALE as Element;
-                if shift_amount < 0 {
-                    cache.update(shift_amount.abs());
-                    (fract_mul, shift_amount.abs())
-                } else {
-                    panic!("RMSNorm normalising factor fract part calculation produced invalid shift amount {}", shift_amount);
-                }
-            } else {
-                // Zero row: use a dummy shift value, the fract_mul will be zeroed
-                cache.update(FIXED_POINT_SCALE as Element + 1);
-                (0i64, FIXED_POINT_SCALE as Element + 1)
+        let mut fract_data = Vec::new();
+        let mut shift_data = Vec::new();
+        // Accumulate exactly in u128, then round once to f64 for the witness
+        // proposal. This avoids both i64 overflow and a row-length-dependent
+        // summation error in the fixed-point rounding envelope.
+        for row in input_data.chunks(row_width) {
+            let sumsq = row.iter().try_fold(0u128, |acc, &x| {
+                let x = i128::from(x);
+                acc.checked_add((x * x) as u128)
+                    .ok_or(anyhow!("RMSNorm squared input norm exceeds u128"))
+            })?;
+            if sumsq == 0 {
+                // Numerical zero behavior remains defined. Proving a genuine
+                // zero row is rejected explicitly by the paper-mode norm check.
+                fract_data.push(0);
+                shift_data.push(FIXED_POINT_SCALE as Element);
+                cache.update(FIXED_POINT_SCALE as Element);
+                continue;
             }
-        }).unzip::<Element, Element, Vec<Element>, Vec<Element>>();
-
-        let max_shift = cache.get_shift();
-
-        for (mul_val, shift_val) in fract_data.iter_mut().zip(shift_data.iter()) {
-            let shift_diff = max_shift - *shift_val;
-            *mul_val <<= shift_diff;
+            let multiplier = (normalised_sum_sq as f64 / sumsq as f64).sqrt();
+            let exponent = multiplier.log2().floor() as i32;
+            let mantissa = multiplier / 2f64.powi(exponent);
+            let shift = FIXED_POINT_SCALE as i32 - exponent;
+            ensure!(
+                (1..63).contains(&shift),
+                "RMSNorm normalising shift is outside the supported range: {shift}"
+            );
+            let fixed =
+                (mantissa * (1u64 << FIXED_POINT_SCALE) as f64).round_ties_even() as Element;
+            cache.update(Element::from(shift));
+            fract_data.push(fixed);
+            shift_data.push(Element::from(shift));
         }
+        let max_shift = cache.get_shift();
+        for (row, (multiplier, shift)) in input_data
+            .chunks(row_width)
+            .zip(fract_data.iter_mut().zip(&shift_data))
+        {
+            let widened = i128::from(*multiplier) << (max_shift - *shift);
+            ensure!(
+                widened < (1i128 << crate::lookup::operation::variant::rms::RMS_MULTIPLIER_BITS),
+                "RMSNorm multiplier exceeds its 48-bit proof range"
+            );
+            *multiplier = Element::try_from(widened)?;
+            let rounding = 1i128 << (max_shift - 1);
+            ensure!(
+                row.iter()
+                    .all(|&x| i64::try_from(i128::from(x) * widened + rounding).is_ok()),
+                "RMSNorm fixed-point product exceeds i64; recalibrate the input scale"
+            );
+        }
+        drop(cache);
 
         let mult_tensor_data = TensorData::new(fract_data, multiplier_shape);
         let mult = WrappedTensor::try_from(mult_tensor_data)?;
@@ -183,7 +181,7 @@ impl RMSNorm<Element> {
             self.alpha.is_some(),
         );
 
-        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 1);
+        let table = Table::new_normalisation(normalisation_scaling_factor.bit_size() + 2);
         let tmp_output = proving_data.apply(input, &table)?;
 
         // Get the alpha
@@ -223,6 +221,28 @@ mod tests {
     };
 
     #[test]
+    fn llama_width_and_zero_rows_are_numerically_defined() {
+        let dim = 2048;
+        let mut layer = RMSNorm::<Element>::new(None, 1e-5, Some(dim)).unwrap();
+        let scale = bounds::normalisation_scale(dim, 12);
+        layer.input_scaling_factor = Some(scale);
+        layer.normalisation_scaling_factor = Some(scale);
+        let mut data = vec![1; dim];
+        data.extend((0..dim).map(|i| i as i64 - 1024));
+        data.extend(std::iter::repeat_n(0, dim));
+        let input = Tensor::new(Shape::new(vec![3, dim]), data).unwrap();
+        let wrapped = WrappedTensor::try_from(&input).unwrap();
+        let output = layer.evaluate_quantised_internal(&[&wrapped]).unwrap();
+        let values = output.outputs()[0].get_data();
+        let (target, bound) = bounds::norm_parameters(dim, scale.scale()).unwrap();
+        for row in values[..2 * dim].chunks(dim) {
+            let squared: Element = row.iter().map(|x| x * x).sum();
+            assert!((squared - target).abs() <= bound);
+        }
+        assert!(values[2 * dim..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
     fn test_quantised() {
         let input = Tensor::<f32>::random(&Shape::new(vec![60, 640]));
         let input_shape = input.shape();
@@ -235,34 +255,8 @@ mod tests {
         let output_native = outputs[0].to_native();
         let output_scaling = ScalingFactor::from_tensor(&output_native, None);
 
-        // We want to calculate the largest quantisation domain that will allow us to fit the magnitude normalisation check into
-        // a single shift check table. This means we need twice the error bound to have a bit length <= SHIFT_CHECK_TABLE_BIT_SIZE.
-        // The error bound is normalisation_dim_size * (1.0 / normalisation_scaling_factor + 0.25) so we can rearrange to find the normalisation_scaling_factor that will allow us to fit into the table.
-        // The rearrangement gives us (2^SHIFT_CHECK_TABLE_BIT_SIZE / normalisation_dim_size) - 0.25 >= 1.0 / normalisation_scaling_factor, so normalisation_scaling_factor >= 1.0 / ((2^SHIFT_CHECK_TABLE_BIT_SIZE / normalisation_dim_size) - 0.25).
-        let minimum_normalising_scale = 2.0
-            / ((1u64 << (SHIFT_CHECK_TABLE_BIT_SIZE - 1)) as f32
-                / layer.normalisation_dim_size as f32
-                - 1.0);
-
-        // The scale is calculated as (float_max - float_min) / (quant_max - quant_min)
-        let mut normalisation_bits = *quantization::BIT_LEN;
-        let norm_max = (layer.normalisation_dim_size() as f32).sqrt();
-        let norm_min = -norm_max;
-
-        let mut test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-        while test_scale < minimum_normalising_scale && normalisation_bits > 1 {
-            normalisation_bits -= 1;
-            test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-        }
-
-        let norm_quant_min: Element = -1 << (normalisation_bits - 1);
-        let norm_quant_max: Element = (1 << (normalisation_bits - 1)) - 1;
-        let normalisation_scaling_factor = ScalingFactor::from_parts(
-            norm_max,
-            norm_min,
-            test_scale,
-            (norm_quant_min, norm_quant_max),
-        );
+        let normalisation_scaling_factor =
+            bounds::normalisation_scale(layer.normalisation_dim_size(), *quantization::BIT_LEN);
 
         let QuantizeOutput { quantized_op, .. } = layer
             .quantise(input_scaling, normalisation_scaling_factor, output_scaling)
@@ -373,29 +367,8 @@ mod tests {
         let output_native = outputs[0].to_native();
         let output_scaling = ScalingFactor::from_tensor(&output_native, None);
 
-        let minimum_normalising_scale = 2.0
-            / ((1u64 << (SHIFT_CHECK_TABLE_BIT_SIZE - 1)) as f32
-                / layer.normalisation_dim_size as f32
-                - 1.0);
-
-        let mut normalisation_bits = *quantization::BIT_LEN;
-        let norm_max = (layer.normalisation_dim_size() as f32).sqrt();
-        let norm_min = -norm_max;
-
-        let mut test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-        while test_scale < minimum_normalising_scale && normalisation_bits > 1 {
-            normalisation_bits -= 1;
-            test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-        }
-
-        let norm_quant_min: Element = -1 << (normalisation_bits - 1);
-        let norm_quant_max: Element = (1 << (normalisation_bits - 1)) - 1;
-        let normalisation_scaling_factor = ScalingFactor::from_parts(
-            norm_max,
-            norm_min,
-            test_scale,
-            (norm_quant_min, norm_quant_max),
-        );
+        let normalisation_scaling_factor =
+            bounds::normalisation_scale(layer.normalisation_dim_size(), *quantization::BIT_LEN);
 
         let QuantizeOutput { quantized_op, .. } = layer
             .quantise(input_scaling, normalisation_scaling_factor, output_scaling)
@@ -448,34 +421,9 @@ mod tests {
             let output_native = outputs[0].to_native();
             let output_scaling = ScalingFactor::from_tensor(&output_native, None);
 
-            // We want to calculate the largest quantisation domain that will allow us to fit the magnitude normalisation check into
-            // a single shift check table. This means we need twice the error bound to have a bit length <= SHIFT_CHECK_TABLE_BIT_SIZE.
-            // The error bound is normalisation_dim_size * (1.0 / normalisation_scaling_factor + 0.25) so we can rearrange to find the normalisation_scaling_factor that will allow us to fit into the table.
-            // The rearrangement gives us (2^SHIFT_CHECK_TABLE_BIT_SIZE / normalisation_dim_size) - 0.25 >= 1.0 / normalisation_scaling_factor, so normalisation_scaling_factor >= 1.0 / ((2^SHIFT_CHECK_TABLE_BIT_SIZE / normalisation_dim_size) - 0.25).
-            let minimum_normalising_scale = 2.0
-            / ((1u64 << (SHIFT_CHECK_TABLE_BIT_SIZE - 1)) as f32
-                / input_shape.dim(-1) as f32
-                - 1.0);
-
-            // The scale is calculated as (float_max - float_min) / (quant_max - quant_min)
-            let mut normalisation_bits = *quantization::BIT_LEN;
-            let norm_max = (layer.normalisation_dim_size() as f32).sqrt();
-            let norm_min = -norm_max;
-
-            let mut test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-            while test_scale < minimum_normalising_scale && normalisation_bits > 1 {
-                normalisation_bits -= 1;
-                test_scale = (norm_max - norm_min) / ((1 << normalisation_bits) as f32);
-            }
-
-            let norm_quant_min: Element = -1 << (normalisation_bits - 1);
-            let norm_quant_max: Element = (1 << (normalisation_bits - 1)) - 1;
-            let normalisation_scaling_factor = ScalingFactor::from_parts(
-                norm_max,
-                norm_min,
-                test_scale,
-                (norm_quant_min, norm_quant_max),
-            );
+            let normalisation_scaling_factor = bounds::normalisation_scale(
+            layer.normalisation_dim_size(), *quantization::BIT_LEN,
+        );
 
             let QuantizeOutput { quantized_op, .. } = layer.quantise(input_scaling, normalisation_scaling_factor, output_scaling).unwrap();
 

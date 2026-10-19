@@ -16,6 +16,13 @@ impl LookupVariant {
         number_of_chunks: usize,
         output: &Tensor<Element>,
     ) -> Result<Vec<HashMap<Element, u64>>> {
+        if self.is_rmsnorm() {
+            return Ok(vec![count_elements(
+                self.rms_residual_columns(number_of_chunks, output)?
+                    .into_iter()
+                    .flatten(),
+            )]);
+        }
         let unpadded_shape = output.unpadded_shape();
         let chunk_size = unpadded_shape.numel() / number_of_chunks;
         let dim_size = unpadded_shape.dim(-1);
@@ -116,6 +123,23 @@ impl LookupVariant {
         constant_challenge: F,
         column_sep_challenge: F,
     ) -> Result<Vec<LogUpInput<F>>> {
+        if self.is_rmsnorm() {
+            let columns = self.rms_residual_columns(number_of_chunks, output)?;
+            return columns
+                .chunks(number_of_chunks)
+                .map(|limb_columns| {
+                    LogUpInput::<F>::new_lookup(
+                        limb_columns
+                            .iter()
+                            .map(|column| column.to_field())
+                            .collect(),
+                        constant_challenge,
+                        column_sep_challenge,
+                        1,
+                    )
+                })
+                .collect();
+        }
         // Check that we have been supplied with output tensor in this case
         let unpadded_shape = output.unpadded_shape();
         let chunk_size = unpadded_shape.numel() / number_of_chunks;

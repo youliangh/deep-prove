@@ -9,16 +9,7 @@ use crate::{
     parser::llm::{HFTokenizer, metadata::LLMMetadata},
     quantization::{LLMInferenceObserver, llm_quant::FPTransformModel},
 };
-use std::{
-    fmt::Display,
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    thread,
-};
+use std::{fmt::Display, ops::Deref};
 
 use crate::{
     Element, IO, Proof, Prover, ProverContext, ScalingStrategy, Shape, Tensor,
@@ -40,15 +31,14 @@ use crate::{
         llm::{Token, models::LLMModelLoader},
         to_quantized,
     },
-    quantization::{InferenceObserver, InferenceTracker, ModelMetadata, ToElement},
+    quantization::{InferenceObserver, InferenceTracker, ModelMetadata},
     tensor::{TensorHandle, TensorTypeParam, WrappedTensor},
     verify,
 };
-use anyhow::{Context, anyhow, ensure};
+use anyhow::{Context, ensure};
 use ark_ff::PrimeField;
 use ark_std::rand::Rng;
 use dp_crypto::arkyper::{CommitmentScheme, transcript::blake3::Blake3Transcript};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tenstore::GenStore;
 use tracing::{debug, info, info_span};
@@ -58,6 +48,152 @@ use crate::model::SanityCheckRunner;
 
 pub trait WithMaxContext {
     fn with_max_context(self, max_context: usize) -> Self;
+}
+
+/// Number of input rows needed to certify exactly `max_new_tokens` predictions.
+/// The final prediction is an output, so it need not be appended to the input.
+pub fn generation_context_length(
+    prompt_len: usize,
+    max_new_tokens: usize,
+) -> anyhow::Result<usize> {
+    ensure!(prompt_len > 0, "The tokenized prompt must not be empty");
+    ensure!(max_new_tokens > 0, "max_new_tokens must be positive");
+    prompt_len
+        .checked_add(max_new_tokens - 1)
+        .context("Requested generation length overflows")
+}
+
+/// Extract continuation predictions from unpadded output rows, including EOS.
+/// An EOS before the final continuation row is rejected rather than hiding data.
+pub fn continuation_tokens(
+    output_rows: &[Token],
+    prompt_len: usize,
+    eos: Token,
+) -> anyhow::Result<Vec<Token>> {
+    ensure!(prompt_len > 0, "The tokenized prompt must not be empty");
+    ensure!(
+        output_rows.len() >= prompt_len,
+        "Output is shorter than the prompt"
+    );
+    let continuation = &output_rows[prompt_len - 1..];
+    ensure!(
+        !continuation[..continuation.len() - 1].contains(&eos),
+        "Continuation contains tokens after EOS"
+    );
+    Ok(continuation.to_vec())
+}
+
+fn numeric_tokens<N: Number>(values: &[N], vocab_size: usize) -> anyhow::Result<Vec<Token>> {
+    values
+        .iter()
+        .map(|value| {
+            let token = value.to_usize();
+            ensure!(
+                token < vocab_size && *value == N::from_usize(token),
+                "Token must be an integer in the model vocabulary"
+            );
+            Ok(Token::from(token))
+        })
+        .collect()
+}
+
+fn validate_sequence(
+    prompt: &[Token],
+    input: &[Token],
+    output: &[Token],
+    max_context: usize,
+    vocab_size: usize,
+    eos: Token,
+) -> anyhow::Result<Vec<Token>> {
+    ensure!(!prompt.is_empty(), "The tokenized prompt must not be empty");
+    ensure!(
+        max_context > 0 && input.len() <= max_context,
+        "Sequence exceeds the configured context length"
+    );
+    ensure!(
+        input.len() == output.len(),
+        "Input/output sequence lengths differ"
+    );
+    ensure!(
+        input.len() >= prompt.len(),
+        "Input is shorter than the prompt"
+    );
+    ensure!(
+        prompt
+            .iter()
+            .chain(input)
+            .chain(output)
+            .all(|t| t.0 < vocab_size),
+        "Token is outside the model vocabulary"
+    );
+    ensure!(
+        input[..prompt.len()] == *prompt,
+        "Public prompt does not match model input"
+    );
+    for i in prompt.len()..input.len() {
+        ensure!(
+            input[i] == output[i - 1],
+            "Input token at position {i} is not the preceding output prediction"
+        );
+    }
+    let continuation = continuation_tokens(output, prompt.len(), eos)?;
+    ensure!(
+        input.len() == max_context || continuation.last() == Some(&eos),
+        "Generation ended before its token limit without EOS"
+    );
+    Ok(continuation)
+}
+
+fn validate_llm_io<F: PrimeField>(
+    io: &IO<F>,
+    prompt: &[Token],
+    max_context: usize,
+    vocab_size: usize,
+    eos: Token,
+) -> anyhow::Result<Vec<Token>> {
+    ensure!(
+        io.input.len() == 1 && io.output.len() == 1,
+        "Expected one input and one output tensor"
+    );
+    let vocab_bound = F::BigInt::from(u64::try_from(vocab_size)?);
+    let mut tokens = Vec::with_capacity(2);
+    for (is_input, tensor) in [(true, &io.input[0]), (false, &io.output[0])] {
+        tensor.validate_shape()?;
+        let shape = tensor.shape();
+        ensure!(
+            shape.rank() == 1 || (!is_input && shape.rank() == 2 && shape.dim(1) == 1),
+            "Expected a token vector or a single-column output tensor"
+        );
+        let rows = tensor.unpadded_shape().dim(0);
+        ensure!(
+            rows <= max_context,
+            "Unpadded sequence exceeds the context length"
+        );
+        ensure!(
+            rows.checked_next_power_of_two() == Some(shape.dim(0)),
+            "Token tensor does not have canonical power-of-two padding"
+        );
+        let values = tensor.data()[..rows]
+            .iter()
+            .map(|value| {
+                // Do not use ToElement on untrusted fields: it panics for large
+                // representatives and interprets modular negatives as integers.
+                let integer = (**value).into_bigint();
+                ensure!(
+                    integer < vocab_bound,
+                    "Public token is outside the model vocabulary"
+                );
+                Ok(Token::from(integer.as_ref()[0] as usize))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(
+            tensor.data()[rows..].iter().all(|value| **value == F::ZERO),
+            "Token padding must be zero"
+        );
+        tokens.push(values);
+    }
+    io.validate_split_binding()?;
+    validate_sequence(prompt, &tokens[0], &tokens[1], max_context, vocab_size, eos)
 }
 
 /// The main struct responsible to verify an LLM proof.
@@ -307,8 +443,12 @@ where
     /// If the number of tokens exceeds the current configured `context_length`.
     pub fn tokens_to_tensor(&self, input: &[Token]) -> anyhow::Result<Tensor<N>> {
         ensure!(
-            input.len() < self.md.config.context_length - 1,
-            "Input sequence length must be less than the context length",
+            !input.is_empty() && input.len() <= self.md.context_length(),
+            "Input sequence must be nonempty and fit the model context length",
+        );
+        ensure!(
+            input.iter().all(|token| token.0 < self.md.vocab_size()),
+            "Input token is outside the model vocabulary"
         );
         let input_tokens = input
             .iter()
@@ -385,6 +525,45 @@ where
         self.run_elements_with_split_info(input_tensor, store, None)
     }
 
+    /// Generate at most `max_new_tokens` tokens, stopping at EOS.
+    ///
+    /// Updates the driver's certification context length. Use that same length
+    /// in the verifier context; obtain it with [`Driver::max_context`].
+    pub fn generate(
+        &mut self,
+        prompt: &[Token],
+        max_new_tokens: usize,
+        store: &mut GenStore,
+    ) -> anyhow::Result<Trace<N>> {
+        let context = generation_context_length(prompt.len(), max_new_tokens)?;
+        ensure!(
+            context <= self.md.context_length(),
+            "Requested generation exceeds the loaded model context length"
+        );
+        let input = self.tokens_to_tensor(prompt)?;
+        self.max_context = Some(context);
+        self.run_elements(input, store)
+    }
+
+    /// Read the exact unpadded continuation represented by a generation trace.
+    pub fn continuation_tokens(
+        &self,
+        trace: &Trace<N>,
+        prompt_len: usize,
+    ) -> anyhow::Result<Vec<Token>> {
+        ensure!(trace.outputs().len() == 1, "Expected one model output");
+        let output = trace.outputs()[0].tensor()?;
+        output.validate_shape()?;
+        ensure!(
+            output.shape().rank() == 1
+                || (output.shape().rank() == 2 && output.shape().dim(1) == 1),
+            "Expected one output token per sequence row"
+        );
+        let length = output.unpadded_shape().dim(0);
+        let tokens = numeric_tokens(&output.data()[..length], self.md.vocab_size())?;
+        continuation_tokens(&tokens, prompt_len, self.md.config.eos_token)
+    }
+
     /// Generate a sentence.
     ///
     /// Notes:
@@ -428,18 +607,22 @@ where
         // Reset the model
         self.model.reset();
 
+        input_tensor.validate_shape()?;
+        ensure!(
+            input_tensor.shape().rank() == 1
+                && input_tensor.shape() == input_tensor.unpadded_shape(),
+            "Generation requires an unpadded one-dimensional token tensor"
+        );
         let input_data = input_tensor.data().to_vec();
         let num_input_tokens = input_data.len();
 
         let mut runner = HandleLifetimeRunner::new(runner, &self.model.graph);
 
-        // -1 because we at least want to generate ONE token
-        ensure!(
-            num_input_tokens < self.md.context_length() - 1,
-            "Input sequence length must be at least one fewer than the context length",
-        );
-
         let max_window = self.max_context.unwrap_or(self.md.context_length());
+        ensure!(
+            max_window > 0 && max_window <= self.md.context_length(),
+            "Generation context is outside the loaded model context length"
+        );
         ensure!(
             num_input_tokens <= max_window,
             "max window {} is smaller than prompt token count {}",
@@ -447,13 +630,7 @@ where
             num_input_tokens,
         );
 
-        let is_valid_vocab = input_data
-            .iter()
-            .all(|t| Number::to_usize(t) < self.md.vocab_size());
-        ensure!(
-            is_valid_vocab,
-            "Input tokens must be less than the vocabulary size",
-        );
+        let prompt_tokens = numeric_tokens(&input_data, self.md.vocab_size())?;
 
         // Initialise the full tokens with the input data, generated tokens will be appended.
         let mut full_sentence = input_data;
@@ -465,42 +642,13 @@ where
         );
         let mut input_handles = tensor_to_handles(&[input_tensor], &self.model.graph, store)?;
 
-        // This thread waits for the results
-        let (tx, rx) = mpsc::sync_channel::<WrappedTensor<N>>(10);
-        let stop = Arc::new(AtomicBool::new(false));
+        let mut generated_tokens = Vec::with_capacity(max_window - num_input_tokens + 1);
         let eos_token: N = self.md.config.eos_token.as_tensor_type_param();
-        let handle = {
-            let stop = Arc::clone(&stop);
-            thread::spawn(move || -> anyhow::Result<Vec<N>> {
-                let mut generated_tokens = Vec::with_capacity(max_window);
-                while let Ok(tensor) = rx.recv() {
-                    let token = tensor.get_data()[0];
-                    if token == eos_token {
-                        stop.store(true, Ordering::Relaxed);
-                        return Ok(generated_tokens);
-                    }
-                    generated_tokens.push(token);
-                }
 
-                // Remove the last token so the final inference will regenerate
-                // a full trace with the correct padding
-                generated_tokens.pop();
-
-                Ok(generated_tokens)
-            })
-        };
-
-        // This loop schedules work to be run, when using a GPU backend this allows for multiple
-        // kernel calls to be scheduled to increase the hardware occupancy.
+        // Resolve each prediction before scheduling the next token: EOS must not
+        // leave speculative tokens in the softmax/normalisation caches used by
+        // the final full-sequence certification pass.
         for unpadded_seq_len in num_input_tokens..=max_window {
-            if stop.load(Ordering::Relaxed) {
-                info!(
-                    "Stopping on iteration {}, an EOS was genarted on some of the previous iteraitons",
-                    unpadded_seq_len,
-                );
-                break;
-            }
-
             info!(
                 "Running iteration {} with input tensor {:?}",
                 unpadded_seq_len,
@@ -536,22 +684,22 @@ where
 
             let last_token_tensor = output.deref().clone().flatten_1d().select(0, index)?;
 
-            tx.send(last_token_tensor.clone())
-                .context("Results thread is gone")?;
+            let token = last_token_tensor.get_data()[0];
+            generated_tokens.push(token);
+            if token == eos_token {
+                break;
+            }
 
             input_handles =
                 wrapped_tensor_to_handles(&[last_token_tensor], &self.model.graph, store)?;
         }
 
-        // Drop the sender channel, signaling to the results thread that no more
-        // work will be scheduled
-        drop(tx);
-
-        let generated_tokens = handle
-            .join()
-            .map_err(|err| anyhow!("Results thread panicked. err: {err:?}"))?
-            .context("Fetch tensor results failed")?;
-        full_sentence.extend(generated_tokens);
+        ensure!(
+            !generated_tokens.is_empty(),
+            "Model did not generate a token"
+        );
+        // The last prediction (including EOS) is certified as an output only.
+        full_sentence.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
         // Inference always runs on unpadded tensors. Padding is handled at the proving layer.
         let tensor = Tensor::new(Shape::new(vec![full_sentence.len()]), full_sentence.clone())?;
 
@@ -570,88 +718,32 @@ where
         let trace = self
             .model
             .run_with_split_nodes_info(vec![tensor], store, split_node_info)?;
-        for i in num_input_tokens..full_sentence.len() {
-            assert_eq!(
-                trace.outputs()[0].tensor().unwrap().data()[i - 1],
-                trace.inputs()[0].tensor().unwrap().data()[i],
-                "Failed for {i}, input: {:?}, output: {:?}",
-                trace.inputs()[0].tensor().unwrap(),
-                trace.outputs()[0].tensor().unwrap(),
+        let generated_result = (|| {
+            ensure!(trace.inputs().len() == 1, "Expected one model input");
+            let input = trace.inputs()[0].tensor()?;
+            let output_tokens = self.continuation_tokens(&trace, num_input_tokens)?;
+            let expected = numeric_tokens(&generated_tokens, self.md.vocab_size())?;
+            ensure!(
+                output_tokens == expected,
+                "Cached generation differs from the full causal certification pass"
             );
-        }
-        let argmax_id = self.md.argmax;
-        let vocab_size = self.md.vocab_size();
-        // If the number of input tokens is less than the max window size then
-        // check that the outputs are correctly shifted.
-        if num_input_tokens < max_window {
-            let output_data = trace.outputs()[0]
-                .tensor()
-                .context("Output tensor should have data")?
-                .data()
-                .to_vec();
-            let input_data = trace.inputs()[0]
-                .tensor()
-                .context("Input tensor should have data")?
-                .data()
-                .to_vec();
-            for i in num_input_tokens..full_sentence.len() {
-                if output_data[i - 1] != input_data[i] {
-                    let logits_input = trace
-                        .get_step(&argmax_id)
-                        .ok_or(anyhow!("No logits step present in trace"))?
-                        .inputs()[0]
-                        .tensor()?;
-                    let logits_shape = logits_input.shape();
-                    let current_row = logits_input.data()[(i - 1) * logits_shape.dim(-1)
-                        ..(i - 1) * logits_shape.dim(-1) + vocab_size]
-                        .to_vec();
-
-                    let value_chosen = crate::number::Number::to_usize(&output_data[i - 1]);
-                    let input_chosen = crate::number::Number::to_usize(&input_data[i]);
-                    let mut row_with_indices = current_row
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .collect::<Vec<(usize, N)>>();
-                    row_with_indices.sort_by(|a, b| b.1.cmp(&a.1));
-
-                    assert_eq!(
-                        current_row[value_chosen],
-                        current_row[input_chosen],
-                        "Logits output chosen {} value {}, input chosen {} value {}, logits row: {},first 10 sorted: {:?}, shape:{:?} input: {:?}, output: {:?}",
-                        value_chosen,
-                        current_row[value_chosen],
-                        input_chosen,
-                        current_row[input_chosen],
-                        i,
-                        &row_with_indices[..10],
-                        logits_shape,
-                        &input_data[num_input_tokens..],
-                        &output_data[num_input_tokens - 1..],
-                    );
-                }
-                assert_eq!(
-                    output_data[i - 1],
-                    input_data[i],
-                    "Failed for {i}, input: {:?}, output: {:?}",
-                    &input_data[num_input_tokens..],
-                    &output_data[num_input_tokens - 1..],
-                );
-            }
-        }
-
-        for i in num_input_tokens..full_sentence.len() {
-            debug_assert_eq!(
-                trace.outputs()[0].tensor().unwrap().data()[i - 1],
-                trace.inputs()[0].tensor().unwrap().data()[i],
-                "Failed for {i}, input: {:?}, output: {:?}",
-                trace.inputs()[0].tensor().unwrap(),
-                trace.outputs()[0].tensor().unwrap(),
-            );
-        }
+            let input_tokens = numeric_tokens(input.data(), self.md.vocab_size())?;
+            let output = trace.outputs()[0].tensor()?;
+            let all_predictions = numeric_tokens(output.data(), self.md.vocab_size())?;
+            validate_sequence(
+                &prompt_tokens,
+                &input_tokens,
+                &all_predictions,
+                max_window,
+                self.md.vocab_size(),
+                self.md.config.eos_token,
+            )?;
+            anyhow::Ok(())
+        })();
 
         // Reset the model so it can be reused.
         self.model.reset();
+        generated_result?;
 
         Ok(trace)
     }
@@ -801,6 +893,24 @@ where
     F: PrimeField,
     PCS: CommitmentScheme<Field = F>,
 {
+    /// Validate the public sequence statement and extract its continuation.
+    /// This does not verify the cryptographic proof; call [`Self::verify`] before
+    /// accepting these tokens as certified model output.
+    pub fn continuation_tokens(&self, prompt: &[Token], io: &IO<F>) -> anyhow::Result<Vec<Token>> {
+        let max_context = self.max_context.unwrap_or(self.md.context_length());
+        ensure!(
+            max_context > 0 && max_context <= self.md.context_length(),
+            "Verifier context length is outside the loaded model context"
+        );
+        validate_llm_io(
+            io,
+            prompt,
+            max_context,
+            self.md.vocab_size(),
+            self.md.config.eos_token,
+        )
+    }
+
     pub fn verify(
         &self,
         proof: Proof<F, PCS>,
@@ -817,61 +927,303 @@ where
             output_tensors = inference_output.output.len()
         );
         let _entered = span.enter();
-        ensure!(
-            inference_output.output.len() == 1,
-            "Expected 1 output tensor, found {}",
-            inference_output.output.len()
-        );
-        // 0. check the size of the output
-        let output = inference_output.output[0].clone();
-        let padded_max_len = output.shape().numel();
-        let max_window = self.max_context.unwrap_or(self.md.context_length());
-
-        // in any case, the output needs to be less than the max context length
-        ensure!(
-            padded_max_len <= max_window.next_power_of_two(),
-            "output length is greater than the padded maximum context length"
-        );
-        // get the actual output length: could be either `max_window`, or when an eos token is found
-        let eos_token = self.md.config.eos_token;
-        let eos_token_found = output
-            .data()
-            .iter()
-            .take(max_window) // consider only the first max_window tokens
-            .skip(user_input.len() - 1) // the first user_input.len() - 1 are not meaningful
-            .find_position(|token| token.to_element() as usize == usize::from(eos_token));
-        let unpadded_output_len = if let Some(pos) = &eos_token_found {
-            pos.0
-        } else {
-            max_window
-        };
-
-        // 1. verify the proof it self
-        let prover_input = inference_output.input[0].clone();
-        let prover_output = inference_output.output[0].clone();
+        self.continuation_tokens(&user_input, &inference_output)?;
         verify::<_, Blake3Transcript, _>(&self.verifier_ctx, proof, inference_output)?;
-        // 2. verify the sequentiality of the output: from the first newly generated token to the last
-        // but without including the padding.
-        // output is [seq_len] where []
-        let seq_len = user_input.len();
-        ensure!(
-            prover_input.data()[..seq_len]
-                .iter()
-                .zip(user_input[..seq_len].iter())
-                .all(|(a, b)| a.to_element().to_usize() == b.0),
-            "user input not the same"
-        );
+        Ok(())
+    }
+}
 
-        #[allow(clippy::needless_range_loop)]
-        for i in seq_len - 1..unpadded_output_len - 1 {
-            // we check the next input token is the one generated by this "row" of the input
-            ensure!(
-                prover_input.data()[i + 1] == prover_output.data()[i],
-                "next input token is not the one generated by this row pos i {}: {:?} != {:?}",
-                i,
-                prover_input.data(),
-                prover_output.data()
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use crate::{
+        graph::NodeId,
+        layers::transformer::{embeddings::Embeddings, logits::Logits},
+        parser::llm::LLMConfig,
+        tensor::KeyedTensor,
+        testing::Pcs,
+    };
+    use ark_ff::{AdditiveGroup, Field};
+
+    type F = ark_bn254::Fr;
+
+    fn tokens(values: &[usize]) -> Vec<Token> {
+        values.iter().copied().map(Token::from).collect()
+    }
+
+    fn public_io(input: &[usize], output: &[usize]) -> anyhow::Result<IO<F>> {
+        let make = |values: &[usize], output: bool| {
+            let mut padded = vec![F::ZERO; values.len().max(1).next_power_of_two()];
+            for (dst, value) in padded.iter_mut().zip(values) {
+                *dst = F::from(*value as u64);
+            }
+            let shape = if output {
+                vec![padded.len(), 1]
+            } else {
+                vec![padded.len()]
+            };
+            let actual = if output {
+                vec![values.len(), 1]
+            } else {
+                vec![values.len()]
+            };
+            Tensor::new_with_unpadded_shape(shape.into(), actual.into(), padded).map(Into::into)
+        };
+        Ok(IO::new(
+            vec![make(input, false)?],
+            vec![make(output, true)?],
+        ))
+    }
+
+    fn check(io: &IO<F>, prompt: &[usize], context: usize) -> anyhow::Result<Vec<Token>> {
+        validate_llm_io(io, &tokens(prompt), context, 8, Token::from(7usize))
+    }
+
+    fn tiny_driver() -> anyhow::Result<Driver<f32>> {
+        let mut model = Model::new_from_input_shapes(vec![vec![1].into()]);
+        let mut weights = vec![0.0f32; 64];
+        for row in 0..8 {
+            weights[row * 8 + (row + 1).min(7)] = 1.0;
+        }
+        let embedding = model.add_consecutive_layer(
+            Layer::Embeddings(Embeddings::new(
+                KeyedTensor::new(
+                    "generation_test_embeddings",
+                    Tensor::new(vec![8, 8].into(), weights)?,
+                )
+                .into(),
+            )?),
+            None,
+        )?;
+        let argmax =
+            model.add_consecutive_layer(Layer::Logits(Logits::new_argmax()), Some(embedding))?;
+        model.automatic_output_labelling()?;
+        Ok(Driver {
+            model,
+            md: LLMMetadata {
+                config: LLMConfig {
+                    model_name: "generation_test".into(),
+                    embedding_size: 8,
+                    hidden_size: 8,
+                    intermediate_size: 8,
+                    num_heads: 1,
+                    head_size: 8,
+                    num_block: 0,
+                    context_length: 8,
+                    norm_epsilon: 1e-5,
+                    vocab_size: 8,
+                    eos_token: Token::from(7usize),
+                },
+                transformers: vec![],
+                embeddings: embedding,
+                positional: None,
+                final_proj: embedding,
+                logits: embedding,
+                argmax,
+            },
+            max_context: Some(8),
+            padding_mode: PaddingMode::NoPadding,
+        })
+    }
+
+    #[test]
+    fn exact_generation_lengths_and_eos() -> anyhow::Result<()> {
+        assert_eq!(generation_context_length(3, 1)?, 3);
+        assert_eq!(generation_context_length(3, 4)?, 6);
+        assert!(generation_context_length(0, 1).is_err());
+        assert!(generation_context_length(1, 0).is_err());
+        assert!(generation_context_length(usize::MAX, 2).is_err());
+        let mut driver = tiny_driver()?;
+        for (prompt, count, expected) in [
+            (vec![0, 1], 1, vec![2]),
+            (vec![0, 1], 4, vec![2, 3, 4, 5]),
+            (vec![0, 6], 4, vec![7]),
+            (vec![0, 4], 5, vec![5, 6, 7]),
+        ] {
+            let trace = driver.generate(&tokens(&prompt), count, &mut GenStore::default())?;
+            assert_eq!(
+                driver.continuation_tokens(&trace, prompt.len())?,
+                tokens(&expected)
             );
+            assert_eq!(
+                trace.inputs()[0].unpadded_shape().numel(),
+                prompt.len() + expected.len() - 1
+            );
+        }
+        assert!(driver.generate(&[], 1, &mut GenStore::default()).is_err());
+        assert!(
+            driver
+                .generate(&tokens(&[0]), 0, &mut GenStore::default())
+                .is_err()
+        );
+        assert!(
+            driver
+                .generate(&tokens(&[0]), 9, &mut GenStore::default())
+                .is_err()
+        );
+        assert!(driver.tokens_to_tensor(&tokens(&[8])).is_err());
+        assert!(numeric_tokens(&[-1i64], 8).is_err());
+        assert!(numeric_tokens(&[1.5f32], 8).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn public_sequence_checks_all_continuations_and_eos_offsets() -> anyhow::Result<()> {
+        let valid = public_io(&[0, 1, 2, 3, 4], &[1, 2, 3, 4, 5])?;
+        assert_eq!(check(&valid, &[0, 1], 5)?, tokens(&[2, 3, 4, 5]));
+        assert!(check(&valid, &[0, 2], 5).is_err());
+        assert!(check(&valid, &[], 5).is_err());
+        assert!(check(&valid, &[0, 1], 4).is_err());
+        assert!(check(&valid, &[0, 1], 6).is_err());
+        assert!(check(&public_io(&[0, 1, 2, 6, 4], &[1, 2, 3, 4, 5])?, &[0, 1], 5).is_err());
+        assert!(check(&public_io(&[0, 1, 2, 3, 4], &[1, 2, 7, 4, 5])?, &[0, 1], 5).is_err());
+        assert!(check(&public_io(&[0, 1], &[1])?, &[0, 1], 5).is_err());
+        assert_eq!(
+            check(&public_io(&[0, 6], &[1, 7])?, &[0, 6], 5)?,
+            tokens(&[7])
+        );
+        // EOS belongs to absolute output row 3, not continuation-relative row 2.
+        assert_eq!(
+            check(&public_io(&[0, 4, 5, 6], &[1, 5, 6, 7])?, &[0, 4], 6)?,
+            tokens(&[5, 6, 7])
+        );
+        assert!(check(&public_io(&[0, 4, 2, 6], &[1, 5, 6, 7])?, &[0, 4], 6).is_err());
+        assert!(check(&public_io(&[0, 6, 7], &[1, 7, 7])?, &[0, 6], 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_public_tensors_are_rejected_without_panics() -> anyhow::Result<()> {
+        let valid = public_io(&[0, 1, 2], &[1, 2, 3])?;
+        let mut changed = valid.clone();
+        changed.input.clear();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        let mut changed = valid.clone();
+        changed.output[0][2] = F::from(8u64).into();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        changed.output[0][2] = (-F::ONE).into();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        changed.output[0][2] = F::from(1u64 << 63).into();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        let mut changed = valid.clone();
+        changed.output[0][3] = F::ONE.into();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        let mut changed = valid.clone();
+        changed.output[0] = Tensor::<F>::new_with_unpadded_shape(
+            vec![4, 1].into(),
+            vec![5, 1].into(),
+            vec![F::ZERO; 4],
+        )?
+        .into();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        let mut changed = valid.clone();
+        changed.output[0] =
+            Tensor::<F>::new_with_unpadded_shape(vec![].into(), vec![].into(), vec![F::ZERO])?
+                .into();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        let mut changed = valid;
+        changed.output[0] =
+            Tensor::<F>::new_with_unpadded_shape(vec![4].into(), vec![0].into(), vec![F::ZERO; 4])?
+                .into();
+        assert!(check(&changed, &[0, 1], 3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn split_public_outputs_are_bound_to_full_sequence() -> anyhow::Result<()> {
+        let split = [(0, vec![NodeId::from(0), NodeId::from(1)])]
+            .into_iter()
+            .collect();
+        let mut io = public_io(&[0, 1, 2, 3, 4], &[1, 2, 3, 4, 5])?
+            .with_splitted_inputs(Some(&split))?
+            .with_splitted_outputs(Some(&split))?;
+        assert!(check(&io, &[0, 1], 5).is_ok());
+        let mut malformed = io.clone();
+        let chunk = malformed.splitted_outputs.as_ref().unwrap()[&0][0].clone();
+        malformed
+            .splitted_outputs
+            .as_mut()
+            .unwrap()
+            .insert(0, vec![chunk; 4]);
+        assert!(check(&malformed, &[0, 1], 5).is_err());
+        io.splitted_outputs.as_mut().unwrap().get_mut(&0).unwrap()[0][0] = F::from(6u64).into();
+        assert!(check(&io, &[0, 1], 5).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn generation_proof_binds_prompt_continuation_last_token_and_length() -> anyhow::Result<()> {
+        let (mut driver, _) = tiny_driver()?.into_provable_llm(None)?;
+        for (prompt, count) in [(vec![0, 1], 4), (vec![0, 6], 4), (vec![0, 4], 5)] {
+            let prompt = tokens(&prompt);
+            let trace = driver.generate(&prompt, count, &mut GenStore::default())?;
+            let expected = driver.continuation_tokens(&trace, prompt.len())?;
+            let (pk, vk) = driver
+                .context::<F, Pcs>()?
+                .with_max_context(driver.max_context().unwrap());
+            let (proof, io) = driver.prove(&pk, trace)?;
+            assert_eq!(vk.continuation_tokens(&prompt, &io)?, expected);
+            vk.verify(proof.clone(), prompt.clone(), io.clone())?;
+            let mut wrong_prompt = prompt.clone();
+            wrong_prompt[0] = Token::from(3usize);
+            assert!(
+                vk.verify(proof.clone(), wrong_prompt.clone(), io.clone())
+                    .is_err()
+            );
+            let mut wrong_prompt_io = io.clone();
+            wrong_prompt_io.input[0][0] = F::from(3u64).into();
+            assert!(
+                vk.continuation_tokens(&wrong_prompt, &wrong_prompt_io)
+                    .is_ok()
+            );
+            assert!(
+                vk.verify(proof.clone(), wrong_prompt, wrong_prompt_io)
+                    .is_err()
+            );
+            let last = io.output[0].unpadded_shape().dim(0) - 1;
+            let mut wrong_last = io.clone();
+            wrong_last.output[0][last] = F::ZERO.into();
+            assert!(
+                vk.verify(proof.clone(), prompt.clone(), wrong_last)
+                    .is_err()
+            );
+            let mut wrong_middle = io.clone();
+            wrong_middle.output[0][prompt.len() - 1] = F::from(6u64).into();
+            assert!(
+                vk.verify(proof.clone(), prompt.clone(), wrong_middle)
+                    .is_err()
+            );
+            if last + 1 > prompt.len() {
+                let mut wrong_input = io.clone();
+                wrong_input.input[0][prompt.len()] = F::ZERO.into();
+                assert!(
+                    vk.verify(proof.clone(), prompt.clone(), wrong_input)
+                        .is_err()
+                );
+                // Keep the causal link internally consistent: only the model
+                // proof can reject this jointly changed prediction and input.
+                let mut wrong_pair = io.clone();
+                wrong_pair.input[0][prompt.len()] = F::ZERO.into();
+                wrong_pair.output[0][prompt.len() - 1] = F::ZERO.into();
+                assert!(vk.continuation_tokens(&prompt, &wrong_pair).is_ok());
+                assert!(
+                    vk.verify(proof.clone(), prompt.clone(), wrong_pair)
+                        .is_err()
+                );
+            }
+            let mut wrong_eos = io.clone();
+            wrong_eos.output[0][prompt.len() - 1] = F::from(7u64).into();
+            if expected != tokens(&[7]) {
+                assert!(vk.verify(proof.clone(), prompt.clone(), wrong_eos).is_err());
+            }
+            let mut wrong_length = io.clone();
+            let shorter = (last + 1).saturating_sub(1);
+            wrong_length.output[0] = Tensor::new_with_unpadded_shape(
+                io.output[0].shape().clone(),
+                vec![shorter, 1].into(),
+                io.output[0].data().clone(),
+            )?;
+            assert!(vk.verify(proof, prompt, wrong_length).is_err());
         }
         Ok(())
     }

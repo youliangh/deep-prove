@@ -28,3 +28,4 @@ devenv.local.nix
 # direnv
 .direnv
 .nltk_data
+__pycache__/
