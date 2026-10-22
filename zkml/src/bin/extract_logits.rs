@@ -24,6 +24,7 @@ use zkml::{
                 gemma3::Gemma3,
                 gpt2::{GPT2, is_gpt2_model},
                 llama3::Llama3,
+                qwen35::Qwen35,
             },
             tokenizer::{LLMTokenizer, TokenizerLoader},
         },
@@ -53,6 +54,10 @@ struct Args {
     #[arg(short, long, default_value = "The quick brown fox")]
     text: String,
 
+    /// Format --text with the Qwen3.5 single-user chat template (thinking disabled).
+    #[arg(long, conflicts_with_all = ["tokens", "tokens_file", "sample_size"])]
+    chat: bool,
+
     /// Number of tokens to generate autoregressively (0 = no generation, just return input logits)
     #[arg(short, long, default_value = "0")]
     num_tokens: usize,
@@ -69,7 +74,7 @@ struct Args {
     #[arg(long, conflicts_with_all = ["tokens", "sample_size"]) ]
     tokens_file: Option<PathBuf>,
 
-    /// Llama3 execution path. Float avoids quantization entirely.
+    /// Calibrated Llama3/Qwen3.5 execution path. Float avoids quantization entirely.
     #[arg(long, value_enum, default_value = "both")]
     mode: ExecutionMode,
 
@@ -130,22 +135,79 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-fn llama3_logits(format: RawSafeTensors, args: &Args) -> Result<()> {
+fn source_hashes(raw: &RawSafeTensors) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut paths = vec![
+        raw.config_path().to_path_buf(),
+        raw.tokenizer_path().to_path_buf(),
+        raw.model_path().to_path_buf(),
+    ];
+    let directory = raw
+        .config_path()
+        .parent()
+        .context("Missing config directory")?;
+    for name in ["tokenizer_config.json", "chat_template.jinja"] {
+        let path = directory.join(name);
+        if path.is_file() {
+            paths.push(path);
+        }
+    }
+    if raw
+        .model_path()
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        let index: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(raw.model_path())?)?;
+        let files = index["weight_map"]
+            .as_object()
+            .context("Missing index weight_map")?
+            .values()
+            .map(|value| value.as_str().context("Invalid indexed shard name"))
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        let parent = raw
+            .model_path()
+            .parent()
+            .context("Missing model directory")?;
+        paths.extend(files.into_iter().map(|name| parent.join(name)));
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .context("Invalid model filename")?
+                .to_string_lossy()
+                .into_owned();
+            Ok((name, sha256_file(&path)?))
+        })
+        .collect()
+}
+
+fn calibrated_logits(format: RawSafeTensors, args: &Args, qwen35: bool) -> Result<()> {
     anyhow::ensure!(
         !args.dump_layer_inputs || args.num_tokens == 0,
         "Layer diagnostics require teacher-forcing (--num-tokens 0)"
     );
     anyhow::ensure!(
         args.sample_size == 0,
-        "For Llama3 use --tokens-file for multiple samples"
+        "Use --tokens-file for multiple calibrated samples"
     );
-    let tokenizer = Llama3::new().load_tokenizer(&format)?;
+    let tokenizer = if qwen35 {
+        Qwen35::new().load_tokenizer(&format)?
+    } else {
+        Llama3::new().load_tokenizer(&format)?
+    };
     let samples = if let Some(path) = &args.tokens_file {
         load_token_samples(path)?
     } else if let Some(ids) = &args.tokens {
         vec![ids.iter().copied().map(Token::from).collect()]
     } else {
-        vec![tokenizer.tokenize(&args.text)]
+        let text = if args.chat {
+            zkml::parser::llm::models::qwen35::chat_prompt(&args.text)
+        } else {
+            args.text.clone()
+        };
+        vec![tokenizer.tokenize(&text)]
     };
     for tokens in &samples {
         anyhow::ensure!(!tokens.is_empty(), "Tokenized prompt is empty");
@@ -159,7 +221,11 @@ fn llama3_logits(format: RawSafeTensors, args: &Args) -> Result<()> {
             "Requested sequence exceeds --max-context"
         );
     }
-    let mut float_driver = Driver::load_from_model(Llama3::new(), &format, Some(args.max_context))?;
+    let mut float_driver = if qwen35 {
+        Driver::load_from_model(Qwen35::new(), &format, Some(args.max_context))?
+    } else {
+        Driver::load_from_model(Llama3::new(), &format, Some(args.max_context))?
+    };
     let mut records = Vec::new();
     let mut quantization_sha256 = None;
     let mut calibration_sha256 = None;
@@ -197,9 +263,18 @@ fn llama3_logits(format: RawSafeTensors, args: &Args) -> Result<()> {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&calibration)?)
         ));
-        let (mut driver, metadata) =
-            zkml::quantization::llm_quant::llama3::quantize(float_driver, &tokenizer, calibration)?;
-        let snapshot = zkml::quantization::llm_quant::llama3::calibration_snapshot(&metadata)?;
+        let (mut driver, metadata) = if qwen35 {
+            zkml::quantization::llm_quant::qwen35::quantize(float_driver, &tokenizer, calibration)?
+        } else {
+            zkml::quantization::llm_quant::llama3::quantize(float_driver, &tokenizer, calibration)?
+        };
+        let snapshot = if qwen35 {
+            zkml::quantization::llm_quant::qwen35::compiled_quantization_snapshot(
+                &driver, &metadata,
+            )?
+        } else {
+            zkml::quantization::llm_quant::llama3::calibration_snapshot(&metadata)?
+        };
         let snapshot_bytes = serde_json::to_vec(&snapshot)?;
         quantization_sha256 = Some(format!("{:x}", Sha256::digest(&snapshot_bytes)));
         if let Some(directory) = &args.output_dir {
@@ -225,11 +300,7 @@ fn llama3_logits(format: RawSafeTensors, args: &Args) -> Result<()> {
         "max_context": args.max_context, "quantization_bits": *zkml::quantization::BIT_LEN,
         "calibration_tokens": args.calibration_tokens, "calibration_samples": args.calibration_samples,
         "calibration_sha256": calibration_sha256, "quantization_sha256": quantization_sha256,
-        "hashes": {
-            "model.safetensors": sha256_file(&args.model.join("model.safetensors"))?,
-            "config.json": sha256_file(&args.model.join("config.json"))?,
-            "tokenizer.json": sha256_file(&args.model.join("tokenizer.json"))?
-        }});
+        "hashes": source_hashes(&format)? });
         serde_json::to_writer_pretty(
             std::fs::File::create(directory.join("manifest.json"))?,
             &manifest,
@@ -461,30 +532,6 @@ fn extract_dimensions(shape: &zkml::Shape) -> (usize, usize) {
     } else {
         (1, shape.dim(0))
     }
-}
-
-/// Validate that required model files exist in the given directory
-fn validate_model_files(model_dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    if !model_dir.is_dir() {
-        bail!("Model path must be a directory: {}", model_dir.display());
-    }
-
-    let required_files = [
-        ("model.safetensors", "Model file"),
-        ("tokenizer.json", "Tokenizer file"),
-        ("config.json", "Config file"),
-    ];
-
-    let mut paths = Vec::new();
-    for (filename, description) in &required_files {
-        let path = model_dir.join(filename);
-        if !path.exists() {
-            bail!("{} not found: {}", description, path.display());
-        }
-        paths.push(path);
-    }
-
-    Ok((paths[0].clone(), paths[1].clone(), paths[2].clone()))
 }
 
 fn extract_logits_from_trace<N, F>(
@@ -745,10 +792,7 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    // Validate model files exist
-    let (model_file, tokenizer_file, config_file) = validate_model_files(&args.model)?;
-
-    let format = RawSafeTensors::new(model_file, tokenizer_file, config_file);
+    let format = RawSafeTensors::from_directory(&args.model)?;
 
     // Detect model type from metadata
     let model_names = format.model_metadata()?;
@@ -758,6 +802,10 @@ fn main() -> Result<()> {
     let is_gemma3 = model_names
         .iter()
         .any(|name| name.to_lowercase().contains("gemma"));
+    let is_qwen35 = model_names
+        .iter()
+        .any(|name| name.to_lowercase().contains("qwen3_5"));
+    anyhow::ensure!(!args.chat || is_qwen35, "--chat currently requires Qwen3.5");
 
     eprintln!("is_gpt2 {is_gpt2}");
 
@@ -769,9 +817,11 @@ fn main() -> Result<()> {
         .iter()
         .any(|name| name.to_lowercase().contains("llama"))
     {
-        llama3_logits(format, &args)?;
+        calibrated_logits(format, &args, false)?;
+    } else if is_qwen35 {
+        calibrated_logits(format, &args, true)?;
     } else {
-        bail!("Unsupported model type. Supported: GPT-2, Gemma3, Llama3.");
+        bail!("Unsupported model type. Supported: GPT-2, Gemma3, Llama3, Qwen3.5.");
     }
 
     Ok(())

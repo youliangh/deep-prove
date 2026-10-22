@@ -1,0 +1,10 @@
+# Isolate this environment from the existing Llama validation environment.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0+cpu
+transformers==5.3.0
+tokenizers==0.22.2
+huggingface-hub==1.33.0
+numpy==2.2.6
+safetensors==0.6.2
+jinja2==3.1.6
+pyarrow==26.0.0

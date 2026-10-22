@@ -8,7 +8,7 @@ use crate::{
         },
         context::ShapeStep,
     },
-    layers::LayerCtx,
+    layers::{LayerCtx, provable::Splittable},
     model::trace::SplittedNodesInfo,
 };
 use anyhow::{Context, anyhow, bail, ensure};
@@ -16,6 +16,10 @@ use ark_ff::PrimeField;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+#[cfg(test)]
+#[path = "context_chunk_guard_tests.rs"]
+mod chunk_guard_tests;
 
 pub type ContextGraph<N> = Graph<LayerCtx<N>, usize, usize, ()>;
 
@@ -41,6 +45,167 @@ impl<F: PrimeField> ModelCtx<F> {
         next_node_id: impl Iterator<Item = NodeId>,
     ) -> anyhow::Result<(Vec<ModelChunk>, SplittedNodesInfo)> {
         ModelChunk::build_chunks(self, num_chunks, strategy, next_node_id)
+    }
+
+    /// Layer witnesses, boundary tensors and lookup-table witnesses share the
+    /// opening accumulator. Their IDs must not overwrite another claim set.
+    pub(crate) fn check_chunk_commitment_ids<'a>(
+        &self,
+        chunks: impl Iterator<Item = &'a ModelChunk>,
+        table_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        let chunks = chunks.collect::<Vec<_>>();
+        let node_ids = chunks
+            .iter()
+            .flat_map(|chunk| chunk.subgraph.nodes().map(|(id, _)| *id))
+            .collect::<HashSet<_>>();
+        ensure!(
+            !node_ids.contains(&table_node_id),
+            "Chunk node ID collides with the reserved lookup-table witness ID"
+        );
+        let mut boundary_ids = HashMap::new();
+        for chunk in chunks {
+            for edge_id in chunk
+                .incoming_edges
+                .keys()
+                .chain(chunk.outgoing_edges.keys())
+            {
+                let edge = chunk.edge(edge_id)?;
+                for link in edge.ports().iter() {
+                    let port = crate::graph::NodeOutput::new(edge.source(), link.source_port);
+                    let id = NodeId::from(ModelChunk::compute_commitment_id(port));
+                    ensure!(
+                        id != table_node_id && !node_ids.contains(&id),
+                        "Boundary commitment ID collides with a layer or lookup-table witness ID"
+                    );
+                    if let Some(previous) = boundary_ids.insert(id, port) {
+                        ensure!(
+                            previous == port,
+                            "Distinct boundary tensors have colliding commitment IDs"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Chunk metadata is supplied by the prover. In particular, a synthetic
+    /// split/merge node must never replace the trusted operation at an existing
+    /// node ID, and an unsplittable operation must retain its full input.
+    fn check_chunk_node_identities(
+        &self,
+        chunks: &BTreeMap<crate::iop::chunking::ChunkID, &ModelChunk>,
+    ) -> anyhow::Result<()> {
+        let mut replacement_origins = HashMap::new();
+        let mut replacement_numbers = BTreeMap::<NodeId, BTreeSet<usize>>::new();
+        for chunk in chunks.values() {
+            for (&original_id, replacement_ids) in &chunk.replaced_nodes {
+                ensure!(
+                    !replacement_ids.is_empty(),
+                    "Empty replacement list for original node {original_id}"
+                );
+                let original = self.nodes.node(original_id).ok_or(anyhow!(
+                    "Replacement refers to unknown original node {original_id}"
+                ))?;
+                if let Node::Inner(layer) = original {
+                    ensure!(
+                        layer.is_splittable(),
+                        "Original node {original_id} does not support horizontal splitting"
+                    );
+                }
+                for &replacement_id in replacement_ids {
+                    ensure!(
+                        self.nodes.node(replacement_id).is_none(),
+                        "Replacement node {replacement_id} collides with a trusted original node"
+                    );
+                    ensure!(
+                        replacement_origins
+                            .insert(replacement_id, original_id)
+                            .is_none(),
+                        "Replacement node {replacement_id} is listed more than once"
+                    );
+                    let replacement = chunk.subgraph.node(replacement_id).ok_or(anyhow!(
+                        "Replacement node {replacement_id} is absent from its chunk"
+                    ))?;
+                    let number = match (original, replacement) {
+                        (Node::Inner(_), Node::Inner(ChunkedNode::ChunkedLayer(layer))) => {
+                            ensure!(
+                                layer.original_node_id == original_id,
+                                "Replacement node {replacement_id} refers to a different original operation"
+                            );
+                            layer.chunk_number
+                        }
+                        (Node::Input(expected), Node::Input(ChunkedIONode::Chunked(io))) => {
+                            ensure!(
+                                io.io_id == *expected,
+                                "Replacement node {replacement_id} refers to a different public tensor"
+                            );
+                            io.chunk_id
+                        }
+                        (Node::Output(expected), Node::Output(ChunkedIONode::Chunked(io))) => {
+                            ensure!(
+                                io.io_id == *expected,
+                                "Replacement node {replacement_id} refers to a different public tensor"
+                            );
+                            io.chunk_id
+                        }
+                        _ => bail!(
+                            "Replacement node {replacement_id} changes the original node kind"
+                        ),
+                    };
+                    ensure!(
+                        replacement_numbers
+                            .entry(original_id)
+                            .or_default()
+                            .insert(number),
+                        "Duplicate horizontal chunk {number} for original node {original_id}"
+                    );
+                }
+            }
+        }
+        for (original_id, numbers) in replacement_numbers {
+            ensure!(
+                numbers.iter().copied().eq(0..numbers.len()),
+                "Horizontal chunks for original node {original_id} are not consecutive from zero"
+            );
+        }
+        for chunk in chunks.values() {
+            for (&node_id, node) in chunk.subgraph.nodes() {
+                if let Some(original) = self.nodes.node(node_id) {
+                    let same_kind = match (original, node) {
+                        (Node::Inner(_), Node::Inner(ChunkedNode::OriginalNode(()))) => true,
+                        (
+                            Node::Input(expected),
+                            Node::Input(ChunkedIONode::OriginalNode(actual)),
+                        )
+                        | (
+                            Node::Output(expected),
+                            Node::Output(ChunkedIONode::OriginalNode(actual)),
+                        ) => expected == actual,
+                        _ => false,
+                    };
+                    ensure!(
+                        same_kind,
+                        "Chunk node {node_id} changes the trusted original node kind"
+                    );
+                } else {
+                    match node {
+                        Node::Inner(
+                            ChunkedNode::SplitLayer(_) | ChunkedNode::RecombinationLayer(_),
+                        ) => {}
+                        Node::Inner(ChunkedNode::ChunkedLayer(_))
+                        | Node::Input(ChunkedIONode::Chunked(_))
+                        | Node::Output(ChunkedIONode::Chunked(_)) => ensure!(
+                            replacement_origins.contains_key(&node_id),
+                            "Synthetic node {node_id} is not a declared replacement"
+                        ),
+                        _ => bail!("Unknown original node {node_id} in chunk graph"),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn check_model_graph_edges_from_chunks(
@@ -601,9 +766,16 @@ impl<F: PrimeField> ModelCtx<F> {
         chunks: impl Iterator<Item = &'a ModelChunk>,
     ) -> anyhow::Result<()> {
         // collect each chunk in a map, altogether with its id
-        let chunks = chunks
-            .map(|chunk| (chunk.chunk_id, chunk))
-            .collect::<BTreeMap<_, _>>();
+        let mut indexed_chunks = BTreeMap::new();
+        for chunk in chunks {
+            ensure!(
+                indexed_chunks.insert(chunk.chunk_id, chunk).is_none(),
+                "Duplicate model chunk ID {}",
+                chunk.chunk_id
+            );
+        }
+        let chunks = indexed_chunks;
+        self.check_chunk_node_identities(&chunks)?;
         // check that the chunks are a partition of the model graph
         // first, compute the set of nodes found in all the chunks
         let nodes_in_chunks =

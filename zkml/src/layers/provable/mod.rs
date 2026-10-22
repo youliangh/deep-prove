@@ -635,6 +635,9 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::Add(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::LayerNorm(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::RMSNorm(ctx) => ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::QwenNorm(ctx) => ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::GatedDeltaScan(ctx) => ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::CausalConv1d(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Logits(ctx) => ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Embeddings(ctx) => ctx.output_shapes(input_shapes, padding_mode),
@@ -650,7 +653,9 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::AttentionMask(attention_mask_ctx) => {
                 attention_mask_ctx.output_shapes(input_shapes, padding_mode)
             }
-            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.output_shapes(input_shapes, padding_mode),
+            LayerCtx::EinSum(einsum_ctx) | LayerCtx::EinSumV2(einsum_ctx) => {
+                einsum_ctx.output_shapes(input_shapes, padding_mode)
+            }
             LayerCtx::Split(split_ctx) => split_ctx.output_shapes(input_shapes, padding_mode),
             LayerCtx::Recombination(rec_ctx) => rec_ctx.output_shapes(input_shapes, padding_mode),
         }
@@ -663,6 +668,9 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::Add(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::LayerNorm(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::RMSNorm(ctx) => ctx.num_outputs(num_inputs),
+            LayerCtx::QwenNorm(ctx) => ctx.num_outputs(num_inputs),
+            LayerCtx::GatedDeltaScan(ctx) => ctx.num_outputs(num_inputs),
+            LayerCtx::CausalConv1d(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.num_outputs(num_inputs),
             LayerCtx::Logits(ctx) => ctx.num_outputs(num_inputs),
             LayerCtx::Embeddings(ctx) => ctx.num_outputs(num_inputs),
@@ -674,7 +682,9 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::AttentionMask(attention_mask_ctx) => {
                 attention_mask_ctx.num_outputs(num_inputs)
             }
-            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.num_outputs(num_inputs),
+            LayerCtx::EinSum(einsum_ctx) | LayerCtx::EinSumV2(einsum_ctx) => {
+                einsum_ctx.num_outputs(num_inputs)
+            }
             LayerCtx::Split(split_ctx) => split_ctx.num_outputs(num_inputs),
             LayerCtx::Recombination(rec_ctx) => rec_ctx.num_outputs(num_inputs),
         }
@@ -687,6 +697,9 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::Positional(ctx) => ctx.describe(),
             LayerCtx::LayerNorm(ctx) => ctx.describe(),
             LayerCtx::RMSNorm(ctx) => ctx.describe(),
+            LayerCtx::QwenNorm(ctx) => ctx.describe(),
+            LayerCtx::GatedDeltaScan(ctx) => ctx.describe(),
+            LayerCtx::CausalConv1d(ctx) => ctx.describe(),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.describe(),
             LayerCtx::Logits(ctx) => ctx.describe(),
             LayerCtx::Embeddings(ctx) => ctx.describe(),
@@ -696,7 +709,7 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.describe(),
             LayerCtx::Flatten => Flatten(true).describe(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.describe(),
-            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.describe(),
+            LayerCtx::EinSum(einsum_ctx) | LayerCtx::EinSumV2(einsum_ctx) => einsum_ctx.describe(),
             LayerCtx::Split(split_ctx) => split_ctx.describe(),
             LayerCtx::Recombination(rec_ctx) => rec_ctx.describe(),
         }
@@ -710,6 +723,9 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::Add(ctx) => ctx.is_provable(),
             LayerCtx::LayerNorm(ctx) => ctx.is_provable(),
             LayerCtx::RMSNorm(ctx) => ctx.is_provable(),
+            LayerCtx::QwenNorm(ctx) => ctx.is_provable(),
+            LayerCtx::GatedDeltaScan(ctx) => ctx.is_provable(),
+            LayerCtx::CausalConv1d(ctx) => ctx.is_provable(),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.is_provable(),
             LayerCtx::Logits(ctx) => ctx.is_provable(),
             LayerCtx::Embeddings(ctx) => ctx.is_provable(),
@@ -718,7 +734,9 @@ impl<F: PrimeField> OpInfo for LayerCtx<F> {
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_provable(),
             LayerCtx::Flatten => Flatten(true).is_provable(),
             LayerCtx::AttentionMask(attention_mask_ctx) => attention_mask_ctx.is_provable(),
-            LayerCtx::EinSum(einsum_ctx) => einsum_ctx.is_provable(),
+            LayerCtx::EinSum(einsum_ctx) | LayerCtx::EinSumV2(einsum_ctx) => {
+                einsum_ctx.is_provable()
+            }
             LayerCtx::Split(split_ctx) => split_ctx.is_provable(),
             LayerCtx::Recombination(rec_ctx) => rec_ctx.is_provable(),
         }
@@ -761,6 +779,15 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
             (LayerCtx::RMSNorm(rmsnorm_ctx), LayerProof::RMSNorm(proof)) => {
                 rmsnorm_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
+            (LayerCtx::QwenNorm(rmsnorm_ctx), LayerProof::QwenNorm(proof)) => {
+                rmsnorm_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
+            }
+            (LayerCtx::GatedDeltaScan(rmsnorm_ctx), LayerProof::GatedDeltaScan(proof)) => {
+                rmsnorm_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
+            }
+            (LayerCtx::CausalConv1d(rmsnorm_ctx), LayerProof::CausalConv1d(proof)) => {
+                rmsnorm_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
+            }
             (LayerCtx::Requant(requant_ctx), LayerProof::Requant(proof)) => {
                 requant_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
@@ -777,6 +804,9 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
                 attention_mask_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::EinSum(einsum_ctx), LayerProof::EinSum(proof)) => {
+                einsum_ctx.verify_legacy(proof, last_claims, verifier, shape_step, node_id)
+            }
+            (LayerCtx::EinSumV2(einsum_ctx), LayerProof::EinSum(proof)) => {
                 einsum_ctx.verify(proof, last_claims, verifier, shape_step, node_id)
             }
             (LayerCtx::Split(split_ctx), LayerProof::SplitLayer(proof)) => {
@@ -871,6 +901,34 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
                     node_id,
                     chunk_number,
                 ),
+            (LayerCtx::QwenNorm(rmsnorm_ctx), LayerProof::QwenNorm(proof)) => rmsnorm_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
+            (LayerCtx::GatedDeltaScan(rmsnorm_ctx), LayerProof::GatedDeltaScan(proof)) => {
+                rmsnorm_ctx.verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                )
+            }
+            (LayerCtx::CausalConv1d(rmsnorm_ctx), LayerProof::CausalConv1d(proof)) => rmsnorm_ctx
+                .verify_chunk(
+                    proof,
+                    last_claims,
+                    verifier,
+                    shape_step,
+                    node_id,
+                    chunk_number,
+                ),
             (LayerCtx::Requant(requant_ctx), LayerProof::Requant(proof)) => requant_ctx
                 .verify_chunk(
                     proof,
@@ -911,7 +969,10 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
                     chunk_number,
                 )
             }
-            (LayerCtx::EinSum(einsum_ctx), LayerProof::EinSum(proof)) => einsum_ctx.verify_chunk(
+            (LayerCtx::EinSum(einsum_ctx), LayerProof::EinSum(proof)) => {
+                einsum_ctx.verify_legacy(proof, last_claims, verifier, shape_step, node_id)
+            }
+            (LayerCtx::EinSumV2(einsum_ctx), LayerProof::EinSum(proof)) => einsum_ctx.verify_chunk(
                 proof,
                 last_claims,
                 verifier,
@@ -959,6 +1020,13 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
             }
             LayerCtx::LayerNorm(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
             LayerCtx::RMSNorm(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::QwenNorm(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::GatedDeltaScan(ctx) => {
+                verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims)
+            }
+            LayerCtx::CausalConv1d(ctx) => {
+                verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims)
+            }
             LayerCtx::Softmax(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
             LayerCtx::Logits(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
             LayerCtx::Embeddings(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
@@ -981,7 +1049,9 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
             LayerCtx::AttentionMask(ctx) => {
                 verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims)
             }
-            LayerCtx::EinSum(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
+            LayerCtx::EinSum(ctx) | LayerCtx::EinSumV2(ctx) => {
+                verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims)
+            }
             LayerCtx::Split(ctx) => verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims),
             LayerCtx::Recombination(ctx) => {
                 verify_input_claim::<F, PCS, _, _, _>(ctx, inputs, claims)
@@ -1008,6 +1078,15 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
             (LayerCtx::RMSNorm(ctx), LayerProof::RMSNorm(p)) => {
                 write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
+            (LayerCtx::QwenNorm(ctx), LayerProof::QwenNorm(p)) => {
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::GatedDeltaScan(ctx), LayerProof::GatedDeltaScan(p)) => {
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
+            }
+            (LayerCtx::CausalConv1d(ctx), LayerProof::CausalConv1d(p)) => {
+                write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
+            }
             (LayerCtx::Softmax(ctx), LayerProof::Softmax(p)) => {
                 write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
@@ -1032,7 +1111,8 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
             (LayerCtx::AttentionMask(ctx), LayerProof::AttentionMask(p)) => {
                 write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
-            (LayerCtx::EinSum(ctx), LayerProof::EinSum(p)) => {
+            (LayerCtx::EinSum(ctx), LayerProof::EinSum(p))
+            | (LayerCtx::EinSumV2(ctx), LayerProof::EinSum(p)) => {
                 write_proof_to_transcript::<F, PCS, _, _>(ctx, p, transcript)
             }
             (LayerCtx::Split(ctx), LayerProof::SplitLayer(p)) => {

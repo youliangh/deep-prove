@@ -167,6 +167,12 @@ where
                 };
                 measure::r("chunk_split", || {
                     let mut transcript = Prover::<F, T, PCS>::initialise_transcript(ctx.ctx)?;
+                    let public_io = full_trace.to_verifier_io::<F>()?;
+                    super::statement::bind_public_io(
+                        ctx.ctx.protocol,
+                        &public_io,
+                        &mut transcript,
+                    )?;
                     // squeeze the common challenge to initialize the transcript for each cbunk
                     let challenge: F = transcript.challenge_scalar();
                     split_node

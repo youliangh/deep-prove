@@ -19,7 +19,7 @@ fn table_poly_id(table_name: String) -> CommitmentId {
 
 /// Data structure containing all the information about polynomials committed as chunks
 /// necessary to build the expression for the opening proof sumcheck
-struct ChunkedCommittedPolyInfo<F> {
+pub(crate) struct ChunkedCommittedPolyInfo<F> {
     // number of chunks the committed polynomial is split into
     num_chunks: usize,
     // number of claims to be aggregated for the committed polynomial
@@ -30,7 +30,7 @@ struct ChunkedCommittedPolyInfo<F> {
 
 /// A utility trait to be implemented by data structures that operate over committed
 /// polynomials that have been split in chunks in order to be committed
-trait ChunkedCommitment {
+pub(crate) trait ChunkedCommitment {
     fn num_chunks(&self) -> usize;
 
     fn num_vars(&self) -> usize;

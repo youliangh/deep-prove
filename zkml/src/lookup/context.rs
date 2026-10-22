@@ -299,6 +299,7 @@ where
                 ChunkedNode::SplitLayer(_) => Ok(Default::default()),
                 ChunkedNode::RecombinationLayer(_) => Ok(Default::default()),
             }
+            .with_context(|| format!("generating lookup witness for {node_id}: {node:?}"))
         })
         .collect::<anyhow::Result<Vec<LookupWitnessGen<'_, F>>>>()?;
     let mut witness_gen =

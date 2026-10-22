@@ -15,6 +15,11 @@ pub enum TableType {
     ShiftCheck,
     SignedZeroCheck,
     ZeroCheck,
+    Sigmoid,
+    Softplus,
+    // A signed-domain exp(min(x, 0)) lookup for standalone gates. Legacy Exp
+    // keeps its negative-domain decomposition and Softmax rounding semantics.
+    ExpNegative,
 }
 
 impl Display for TableType {
@@ -28,6 +33,9 @@ impl Display for TableType {
             TableType::ShiftCheck => "ShiftCheckTable",
             TableType::SignedZeroCheck => "SignedZeroCheckTable",
             TableType::ZeroCheck => "ZeroCheckTable",
+            TableType::Sigmoid => "SigmoidTable",
+            TableType::Softplus => "SoftplusTable",
+            TableType::ExpNegative => "ExpNegativeTable",
         };
         write!(f, "{}", name)
     }
@@ -87,10 +95,19 @@ impl TableType {
         input_max: Element,
     ) -> Result<Element> {
         let output = match self {
-            TableType::Exp => {
+            TableType::Sigmoid | TableType::Softplus => {
+                let x = input.clamp(input_min, input_max) as f32 / input_sf;
+                let y = if matches!(self, TableType::Sigmoid) {
+                    sigmoid_float(x)
+                } else {
+                    softplus_float(x)
+                };
+                (y * output_sf).round_ties_even() as Element
+            }
+            TableType::Exp | TableType::ExpNegative => {
                 if input <= input_min {
                     0
-                } else if input >= input_max {
+                } else if input >= 0 {
                     output_sf.round_ties_even() as Element
                 } else {
                     let float_exp = (input as f32 / input_sf).exp();
@@ -163,8 +180,26 @@ impl TableType {
             TableType::ZeroCheck => transcript.append_and_sample(b"Zero"),
             TableType::SignedZeroCheck => transcript.append_and_sample(b"SignedZero"),
             TableType::ShiftCheck => transcript.append_and_sample(b"ShiftCheck"),
+            TableType::Sigmoid => transcript.append_and_sample(b"Sigmoid"),
+            TableType::Softplus => transcript.append_and_sample(b"Softplus"),
+            TableType::ExpNegative => transcript.append_and_sample(b"ExpNegative"),
         }
     }
+}
+
+/// Stable sigmoid, including large negative arguments.
+pub(crate) fn sigmoid_float(x: f32) -> f32 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// PyTorch's default softplus switches to the linear branch above 20.
+pub(crate) fn softplus_float(x: f32) -> f32 {
+    if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
 /// Compute the GeLU

@@ -646,7 +646,24 @@ impl<'a, F: PrimeField, T: Transcript, PCS: CommitmentScheme<Field = F>> Verifie
         T: InitTranscript,
     {
         let mut transcript = Self::initialise_transcript(ctx)?;
+        super::statement::bind_public_io(ctx.protocol, io, &mut transcript)?;
         let verifier = Verifier::<'_, F, T, PCS>::new(&mut transcript, io);
+
+        // Reject prover-controlled node substitutions before using their
+        // operations to derive shapes or dispatch any proof verification.
+        ctx.model.check_model_chunking(
+            proof
+                .chunk_proofs
+                .iter()
+                .map(|chunk_proof| &chunk_proof.chunk_data.model_chunk),
+        )?;
+        ctx.model.check_chunk_commitment_ids(
+            proof
+                .chunk_proofs
+                .iter()
+                .map(|chunk_proof| &chunk_proof.chunk_data.model_chunk),
+            ctx.commitment_ctx.table_node_id(),
+        )?;
 
         // compute padded and unpadded input shapes, using the splitted inputs/output tensors, if any
         let splitted_inputs = if let Some(splitted_inputs) = io.splitted_inputs.as_ref() {
@@ -700,14 +717,6 @@ impl<'a, F: PrimeField, T: Transcript, PCS: CommitmentScheme<Field = F>> Verifie
                 &padded_input_shapes,
             )?
         };
-
-        // verify chunks are well defined
-        ctx.model.check_model_chunking(
-            proof
-                .chunk_proofs
-                .iter()
-                .map(|chunk_proof| &chunk_proof.chunk_data.model_chunk),
-        )?;
 
         // verify consistency of commitments among chunks
         let chunk_commitments_by_id = proof

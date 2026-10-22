@@ -27,6 +27,7 @@ use tenstore::StorageKey;
 use tracing::trace;
 
 pub mod layernorm;
+pub mod qwen_norm;
 pub mod rmsnorm;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

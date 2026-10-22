@@ -7,6 +7,9 @@ use crate::{graph::NodeId, parser::llm::LLMConfig};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LLMMetadata {
     pub config: LLMConfig,
+    /// Additional stop tokens bound into the trusted verifier context.
+    #[serde(default)]
+    pub additional_eos_tokens: Vec<super::Token>,
     pub transformers: Vec<TransformerMetadata>,
     pub embeddings: NodeId,
     pub positional: Option<NodeId>,
@@ -18,6 +21,15 @@ pub struct LLMMetadata {
 }
 
 impl LLMMetadata {
+    pub fn eos_tokens(&self) -> Vec<super::Token> {
+        let mut tokens = vec![self.config.eos_token];
+        for &token in &self.additional_eos_tokens {
+            if !tokens.contains(&token) {
+                tokens.push(token);
+            }
+        }
+        tokens
+    }
     pub fn vocab_size(&self) -> usize {
         self.config.vocab_size
     }
@@ -30,8 +42,20 @@ impl LLMMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TransformerMetadata {
     pub norm_id: NodeId,
-    pub transformer: AttentionMetadata,
+    /// Present only for softmax attention blocks.
+    pub transformer: Option<AttentionMetadata>,
+    /// Present only for causal recurrent attention blocks.
+    #[serde(default)]
+    pub linear_attention: Option<LinearAttentionMetadata>,
     pub ffn: FFNGraphID,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinearAttentionMetadata {
+    pub qkv_ids: [NodeId; 3],
+    pub convolution_ids: [NodeId; 3],
+    pub recurrence_id: NodeId,
+    pub final_proj_id: NodeId,
 }
 
 /// Structure containing relevant node IDs of a transformer, e.g. qkv, softmax, residual, etc.
@@ -75,7 +99,14 @@ mod tests {
         assert_eq!(embeddings_id, computed_embeddings_id);
         let norm_id = model.graph().successors(embeddings_id)[0];
         let qkv_id = model.graph().successors(norm_id)[0];
-        assert_eq!(qkv_id, md.transformers[0].transformer.qkv_id);
+        assert_eq!(
+            qkv_id,
+            md.transformers[0]
+                .transformer
+                .as_ref()
+                .expect("softmax attention metadata")
+                .qkv_id
+        );
         // So attention is
         // * qkv, norm, rope, qkt, mask, softmax, qv, final_proj,
         // * then norm , and residual and norm again and then ffn

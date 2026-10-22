@@ -62,6 +62,7 @@ use tract_onnx::tract_hir::internal::num_integer::div_ceil;
 use verify::EinSumVerifierInfo;
 
 pub mod axis;
+mod bound;
 pub(crate) mod constructor;
 pub(crate) mod evaluate;
 pub(crate) mod op_info;
@@ -402,7 +403,7 @@ where
 impl ProveInfo for EinSum<Element> {
     fn step_info<F: PrimeField>(&self, aux: ContextAux) -> Result<(LayerCtx<F>, ContextAux)> {
         self.to_context(aux)
-            .map(|(ctx, aux)| (LayerCtx::EinSum(ctx), aux))
+            .map(|(ctx, aux)| (LayerCtx::EinSumV2(ctx), aux))
     }
 }
 
@@ -449,7 +450,7 @@ where
             claims,
             proof,
             commitment_map,
-        } = self.prove_internal(ctx, last_claims, &inputs, prover.transcript)?;
+        } = self.prove_bound(ctx, last_claims, &inputs, prover.transcript)?;
 
         // Add the proof to the proof list
         prover.push_proof(node_id, LayerProof::<F, PCS>::EinSum(proof));
@@ -613,7 +614,7 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
         let EinSumVerifierInfo {
             claims,
             constants_map,
-        } = self.verify_internal(proof, last_claims, shape_step, verifier.transcript)?;
+        } = self.verify_bound(proof, last_claims, shape_step, verifier.transcript)?;
         // Add the constant claims to the verifier
         verifier.add_common_claims(node_id, constants_map);
         Ok(claims)
@@ -625,6 +626,25 @@ impl<F: PrimeField, PCS: CommitmentScheme<Field = F>> VerifiableCtx<F, PCS> for 
         _transcript: &mut T,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+}
+
+impl<F: PrimeField> EinSumContext<F> {
+    /// Explicit legacy artifact route. Newly constructed contexts use EinSumV2.
+    pub(crate) fn verify_legacy<T: Transcript, PCS: CommitmentScheme<Field = F>>(
+        &self,
+        proof: &EinSumProof<F>,
+        last_claims: &[&Claim<F>],
+        verifier: &mut Verifier<F, T, PCS>,
+        shape_step: &ShapeStep,
+        node_id: NodeId,
+    ) -> Result<Vec<Claim<F>>> {
+        let EinSumVerifierInfo {
+            claims,
+            constants_map,
+        } = self.verify_internal(proof, last_claims, shape_step, verifier.transcript)?;
+        verifier.add_common_claims(node_id, constants_map);
+        Ok(claims)
     }
 }
 

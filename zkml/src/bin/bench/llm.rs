@@ -23,13 +23,14 @@ use zkml::{
     model::{
         exec_graph::InferenceEngine,
         llm::{Driver, LLMVerifierContext, WithMaxContext, generation_context_length},
+        llm_artifact::{ARTIFACT_VERSION, ArtifactKind, decode_verifier, encode_artifact},
     },
     parser::{
         file_cache,
         gguf::RawGGUF,
         llm::{
             HFTokenizer, LLMTokenizer, Token,
-            models::{gemma3::Gemma3, gpt2::GPT2, llama2::Llama2, llama3::Llama3},
+            models::{gemma3::Gemma3, gpt2::GPT2, llama2::Llama2, llama3::Llama3, qwen35::Qwen35},
             tokenizer::TokenizerLoader,
         },
         safe::RawSafeTensors,
@@ -50,6 +51,7 @@ enum Model {
     Gemma3,
     Llama2,
     Llama3,
+    Qwen35,
 }
 
 impl std::fmt::Display for Model {
@@ -59,6 +61,7 @@ impl std::fmt::Display for Model {
             Model::Gemma3 => write!(f, "gemma3"),
             Model::Llama2 => write!(f, "llama2"),
             Model::Llama3 => write!(f, "llama3"),
+            Model::Qwen35 => write!(f, "qwen35"),
         }
     }
 }
@@ -86,6 +89,10 @@ struct LLMArgs {
     #[arg(long, conflicts_with = "prompt_tokens")]
     prompt: Option<String>,
 
+    /// Apply the local Qwen3.5 non-thinking text chat format.
+    #[arg(long, requires = "prompt")]
+    chat: bool,
+
     /// JSON array of exact prompt token IDs, including any desired BOS token.
     #[arg(long)]
     prompt_tokens: Option<PathBuf>,
@@ -103,7 +110,7 @@ struct LLMArgs {
     )]
     max_new_tokens: usize,
 
-    /// JSON array of token-ID arrays used for Llama 3 calibration.
+    /// JSON array of token-ID arrays used for Llama 3 or Qwen3.5 calibration.
     #[arg(long)]
     calibration_tokens: Option<PathBuf>,
 
@@ -233,8 +240,8 @@ fn main() -> anyhow::Result<()> {
 
     let args = LLMArgs::parse();
     ensure!(
-        !matches!(args.model, Model::Llama3) || args.load_params.is_none(),
-        "Llama3 --load-params is disabled until cached parameters bind the model and calibration fingerprints"
+        !matches!(args.model, Model::Llama3 | Model::Qwen35) || args.load_params.is_none(),
+        "Calibrated model --load-params is disabled until cached parameters bind the model and calibration fingerprints"
     );
 
     // either its spceified and if 0 it's the physical cores otherwise what is specified but no more than the logical cores
@@ -253,11 +260,18 @@ fn main() -> anyhow::Result<()> {
         .build_global()
         .unwrap();
 
+    ensure!(
+        !args.chat || matches!(args.model, Model::Qwen35),
+        "--chat requires --model qwen35"
+    );
     let source = load_source(&args)?;
     let model_fingerprints = if args.artifacts_dir.is_some() {
         match &source {
             ModelSource::Safe(raw) => Some(serde_json::json!({
-                "weights_sha256": sha256_file(raw.model_path())?,
+                "weights_sha256": sha256_hf_weights(raw)?,
+                "weights_index_sha256": if raw.model_path().extension().is_some_and(|extension| extension == "json") {
+                    Some(sha256_file(raw.model_path())?)
+                } else { None },
                 "config_sha256": sha256_file(raw.config_path())?,
                 "tokenizer_sha256": sha256_file(raw.tokenizer_path())?
             })),
@@ -272,9 +286,14 @@ fn main() -> anyhow::Result<()> {
             .with_context(|| format!("Reading prompt tokens from {}", path.display()))?;
         Some(ids.into_iter().map(Token::from).collect::<Vec<_>>())
     } else {
-        args.prompt
-            .as_ref()
-            .map(|prompt| tokeniser.tokenize(prompt))
+        args.prompt.as_ref().map(|prompt| {
+            let text = if args.chat {
+                zkml::parser::llm::models::qwen35::chat_prompt(prompt)
+            } else {
+                prompt.clone()
+            };
+            tokeniser.tokenize(&text)
+        })
     };
     let prompt_cases = args
         .prompt_cases
@@ -291,8 +310,8 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|path| -> anyhow::Result<_> {
             ensure!(
-                matches!(args.model, Model::Llama3),
-                "--calibration-tokens currently requires --model llama3"
+                matches!(args.model, Model::Llama3 | Model::Qwen35),
+                "--calibration-tokens requires --model llama3 or qwen35"
             );
             let mut rows: Vec<Vec<usize>> = serde_json::from_reader(File::open(path)?)
                 .with_context(|| format!("Reading calibration tokens from {}", path.display()))?;
@@ -409,6 +428,10 @@ fn main() -> anyhow::Result<()> {
         premeasure.r(HEADER_MODEL_QUANT, || {
             zkml::quantization::llm_quant::llama3::quantize(driver, &tokeniser, calibration)
         })?
+    } else if matches!(args.model, Model::Qwen35) {
+        premeasure.r(HEADER_MODEL_QUANT, || {
+            zkml::quantization::llm_quant::qwen35::quantize(driver, &tokeniser, calibration)
+        })?
     } else if !args.accuracy {
         premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?
     } else {
@@ -420,13 +443,21 @@ fn main() -> anyhow::Result<()> {
                 driver.into_provable_llm_with_transform::<Gemma3>(&tokeniser)
             })?,
             Model::Llama2 => premeasure.r(HEADER_MODEL_QUANT, || driver.into_provable_llm(None))?,
-            Model::Llama3 => unreachable!("Llama3 uses calibrated quantization above"),
+            Model::Llama3 | Model::Qwen35 => {
+                unreachable!("Model uses calibrated quantization above")
+            }
         }
     };
-    let quantization_sha256 = if matches!(args.model, Model::Llama3)
+    let quantization_sha256 = if matches!(args.model, Model::Llama3 | Model::Qwen35)
         && let Some(directory) = &args.artifacts_dir
     {
-        let snapshot = zkml::quantization::llm_quant::llama3::calibration_snapshot(&metadata)?;
+        let snapshot = if matches!(args.model, Model::Qwen35) {
+            zkml::quantization::llm_quant::qwen35::compiled_quantization_snapshot(
+                &driver, &metadata,
+            )?
+        } else {
+            zkml::quantization::llm_quant::llama3::calibration_snapshot(&metadata)?
+        };
         let bytes = serde_json::to_vec(&snapshot)?;
         let digest = format!("{:x}", Sha256::digest(&bytes));
         std::fs::create_dir_all(directory)?;
@@ -443,11 +474,7 @@ fn main() -> anyhow::Result<()> {
             bincode::config::standard(),
         )?
         .0;
-        let verifier_ctx = bincode::serde::decode_from_slice(
-            &std::fs::read(format!("{params}.vk"))?,
-            bincode::config::standard(),
-        )?
-        .0;
+        let verifier_ctx = decode_verifier(&std::fs::read(format!("{params}.vk"))?)?;
         // set to 0 since we're not spending any time generating it
         premeasure.r(HEADER_CONTEXT_GENERATION, || 0);
         (prover_ctx, verifier_ctx)
@@ -469,10 +496,7 @@ fn main() -> anyhow::Result<()> {
             bincode::config::standard(),
         )?)?;
         let mut io = File::create(format!("{save_params}.vk"))?;
-        io.write_all(&bincode::serde::encode_to_vec(
-            &verifier_ctx,
-            bincode::config::standard(),
-        )?)?;
+        io.write_all(&encode_artifact(ArtifactKind::Verifier, &verifier_ctx)?)?;
     }
 
     let multiple_sequences = sequence.len() > 1;
@@ -602,7 +626,7 @@ fn main() -> anyhow::Result<()> {
             utils::track::flame_graph();
         }
 
-        let proof_bytes = bincode::serde::encode_to_vec(&proof, bincode::config::standard())?;
+        let proof_bytes = encode_artifact(ArtifactKind::Proof, &proof)?;
         measure::set(HEADER_PROOF_SIZE, proof_bytes.len());
         verifier_ctx = verifier_ctx.with_max_context(max_ctx);
         let verified_tokens = verifier_ctx.continuation_tokens(&user_tokens, &io)?;
@@ -615,8 +639,8 @@ fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(|_| -> anyhow::Result<_> {
                 Ok((
-                    bincode::serde::encode_to_vec(&io, bincode::config::standard())?,
-                    bincode::serde::encode_to_vec(&verifier_ctx, bincode::config::standard())?,
+                    encode_artifact(ArtifactKind::Io, &io)?,
+                    encode_artifact(ArtifactKind::Verifier, &verifier_ctx)?,
                 ))
             })
             .transpose()?;
@@ -665,7 +689,8 @@ fn main() -> anyhow::Result<()> {
                 "generated_text": generated_text,
                 "full_text": tokeniser.detokenize(&all_tokens),
                 "proof_bytes": proof_bytes.len(),
-                "serialization": "bincode-2-standard",
+                "serialization": format!("deep-prove-llm-v{ARTIFACT_VERSION}/bincode-2-standard"),
+                "artifact_version": ARTIFACT_VERSION,
                 "pcs": "HyperKZG-BN254"
             });
             std::fs::write(directory.join("proof.bin"), &proof_bytes)?;
@@ -784,6 +809,44 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+/// Bind indexed checkpoints to every actual shard, not just the JSON filenames.
+fn sha256_hf_weights(raw: &RawSafeTensors) -> anyhow::Result<String> {
+    if raw
+        .model_path()
+        .extension()
+        .is_some_and(|ext| ext == "safetensors")
+    {
+        return sha256_file(raw.model_path());
+    }
+    let index: serde_json::Value = serde_json::from_reader(File::open(raw.model_path())?)?;
+    let map = index["weight_map"]
+        .as_object()
+        .context("Missing SafeTensors weight_map")?;
+    let directory = raw.model_path().parent().context("No model directory")?;
+    let mut shards = std::collections::BTreeMap::new();
+    for value in map.values() {
+        let name = value.as_str().context("Invalid shard name")?;
+        ensure!(
+            Path::new(name)
+                .components()
+                .all(|p| matches!(p, std::path::Component::Normal(_))),
+            "Unsafe shard path"
+        );
+        if !shards.contains_key(name) {
+            shards.insert(name.to_owned(), sha256_file(&directory.join(name))?);
+        }
+    }
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&serde_json::json!({
+            // The index maps tensor names to shards; identical shard files with
+            // a different mapping must not share a model fingerprint.
+            "index_sha256": sha256_file(raw.model_path())?,
+            "shards": shards,
+        }))?)
+    ))
+}
+
 enum ModelSource {
     Gguf(RawGGUF),
     Safe(RawSafeTensors),
@@ -805,18 +868,9 @@ fn load_source(args: &LLMArgs) -> anyhow::Result<ModelSource> {
         )?)));
     }
     if let Some(directory) = &args.hf_dir {
-        for name in ["model.safetensors", "tokenizer.json", "config.json"] {
-            ensure!(
-                directory.join(name).is_file(),
-                "Missing local HF file: {}",
-                directory.join(name).display()
-            );
-        }
-        return Ok(ModelSource::Safe(RawSafeTensors::new(
-            directory.join("model.safetensors"),
-            directory.join("tokenizer.json"),
-            directory.join("config.json"),
-        )));
+        return Ok(ModelSource::Safe(RawSafeTensors::from_directory(
+            directory,
+        )?));
     }
     let repository = args
         .hf
@@ -852,6 +906,7 @@ fn parse_model(
             Model::Gemma3 => Driver::load_from_model(Gemma3::new(), raw, Some(max_context)),
             Model::Llama2 => Driver::load_from_model(Llama2::new(), raw, Some(max_context)),
             Model::Llama3 => Driver::load_from_model(Llama3::new(), raw, Some(max_context)),
+            Model::Qwen35 => Driver::load_from_model(Qwen35::new(), raw, Some(max_context)),
         },
     }
 }

@@ -73,7 +73,8 @@ impl LayerInsertion for GPT2Decoder {
 
         let md = TransformerMetadata {
             norm_id: initial_norm_id,
-            transformer: attention_md,
+            transformer: Some(attention_md),
+            linear_attention: None,
             ffn: ffn_md,
         };
         Ok((final_add_id, md))

@@ -7,7 +7,9 @@ use crate::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub mod attention_mask;
+pub mod causal_conv1d;
 pub mod embeddings;
+pub mod gated_delta;
 pub mod logits;
 pub mod normalisation;
 pub mod positional;

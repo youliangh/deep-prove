@@ -7,7 +7,14 @@ use clap::Parser;
 use dp_crypto::arkyper::HyperKZG;
 use serde::{Deserialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use zkml::{IO, Proof, model::llm::LLMVerifierContext, parser::llm::Token};
+use zkml::{
+    IO, Proof,
+    model::{
+        llm::LLMVerifierContext,
+        llm_artifact::{ArtifactKind, decode_artifact, decode_verifier},
+    },
+    parser::llm::Token,
+};
 
 type F = ark_bn254::Fr;
 type Pcs = HyperKZG<Bn254>;
@@ -67,7 +74,7 @@ fn verify_artifacts(args: Args) -> Result<()> {
     let verifier_bytes = fs::read(&args.verifier)
         .with_context(|| format!("Reading trusted verifier {}", args.verifier.display()))?;
     let verifier_sha256 = check_digest(&verifier_bytes, args.verifier_sha256.as_deref())?;
-    let verifier: LLMVerifierContext<F, Pcs> = decode_exact(&verifier_bytes)?;
+    let verifier: LLMVerifierContext<F, Pcs> = decode_verifier(&verifier_bytes)?;
 
     let artifact_prompt: Vec<u32> = read_json(&args.artifacts_dir.join("prompt_tokens.json"))?;
     let prompt = if let Some(path) = &args.prompt_tokens {
@@ -84,8 +91,14 @@ fn verify_artifacts(args: Args) -> Result<()> {
     let report: ArtifactReport = read_json(&args.artifacts_dir.join("result.json"))?;
     validate_report(&report, &prompt, &generated, &verifier_sha256)?;
 
-    let proof: Proof<F, Pcs> = decode_exact(&fs::read(args.artifacts_dir.join("proof.bin"))?)?;
-    let io: IO<F> = decode_exact(&fs::read(args.artifacts_dir.join("io.bin"))?)?;
+    let proof: Proof<F, Pcs> = decode_artifact(
+        ArtifactKind::Proof,
+        &fs::read(args.artifacts_dir.join("proof.bin"))?,
+    )?;
+    let io: IO<F> = decode_artifact(
+        ArtifactKind::Io,
+        &fs::read(args.artifacts_dir.join("io.bin"))?,
+    )?;
     let prompt_tokens = prompt.iter().copied().map(Token::from).collect::<Vec<_>>();
     let certified = verifier.continuation_tokens(&prompt_tokens, &io)?;
     let certified_ids = certified.iter().map(u32::from).collect::<Vec<_>>();
@@ -102,13 +115,14 @@ fn verify_artifacts(args: Args) -> Result<()> {
         let digest = check_digest(&bytes, args.tokenizer_sha256.as_deref())?;
         let tokenizer = tokenizers::Tokenizer::from_bytes(bytes)
             .map_err(|error| anyhow::anyhow!("Loading trusted tokenizer: {error}"))?;
-        let text = decode_text(&tokenizer, &certified_ids)?;
+        let exact_decoding = verifier.md.config.model_name == "qwen35";
+        let text = decode_text(&tokenizer, &certified_ids, exact_decoding)?;
         let all_tokens = prompt
             .iter()
             .chain(&certified_ids)
             .copied()
             .collect::<Vec<_>>();
-        let full_text = decode_text(&tokenizer, &all_tokens)?;
+        let full_text = decode_text(&tokenizer, &all_tokens, exact_decoding)?;
         ensure!(
             text == report.generated_text,
             "result.json generated text differs from decoded certified tokens"
@@ -165,6 +179,7 @@ fn check_digest(bytes: &[u8], expected: Option<&str>) -> Result<String> {
     Ok(actual)
 }
 
+#[cfg(test)]
 fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
     ensure!(
@@ -197,12 +212,17 @@ fn validate_report(
     Ok(())
 }
 
-fn decode_text(tokenizer: &tokenizers::Tokenizer, ids: &[u32]) -> Result<String> {
+fn decode_text(tokenizer: &tokenizers::Tokenizer, ids: &[u32], exact: bool) -> Result<String> {
     let text = tokenizer
         .decode(ids, true)
         .map_err(|error| anyhow::anyhow!("Decoding certified tokens: {error}"))?;
-    // Match HFTokenizer::detokenize, used by bench-llm to write these artifacts.
-    Ok(text.strip_prefix(' ').unwrap_or(&text).to_owned())
+    // Match the model's trusted decoding convention. Qwen preserves the exact
+    // tokenizer JSON decoder; older models retain their historical space trim.
+    if exact {
+        Ok(text)
+    } else {
+        Ok(text.strip_prefix(' ').unwrap_or(&text).to_owned())
+    }
 }
 
 #[cfg(test)]

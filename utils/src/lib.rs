@@ -6,7 +6,7 @@ use std::{
     io::{self, Write},
     ops::DerefMut,
     path::Path,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -285,12 +285,28 @@ pub struct Metrics {
 
 impl Metrics {
     /// Start measuring a time span.
+    ///
+    /// Set `DEEP_PROVE_DISABLE_MEMORY_STATS=1` before starting the process to
+    /// skip OS memory sampling, which can be expensive for large resident sets.
+    /// This setting is read once, on the first measurement. Elapsed time and
+    /// allocator metrics are still collected; OS memory fields become `None`.
+    /// The default continues to collect all available metrics. External tools
+    /// such as `/usr/bin/time -v` can record peak RSS when sampling is disabled.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        static DISABLE_MEMORY_STATS: OnceLock<bool> = OnceLock::new();
+
         Self {
             when: Instant::now(),
             allocator_metrics: track::allocator_metrics(),
-            memory_stats: memory_stats(),
+            memory_stats: if *DISABLE_MEMORY_STATS.get_or_init(|| {
+                std::env::var_os("DEEP_PROVE_DISABLE_MEMORY_STATS")
+                    .is_some_and(|value| value == "1")
+            }) {
+                None
+            } else {
+                memory_stats()
+            },
         }
     }
 

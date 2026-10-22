@@ -257,52 +257,62 @@ impl ChunkingInfo {
                 self.number_of_zeroing_chunks,
             ),
             |mut acc, value| {
-                // The value after applying the offset is always non-negative
+                // The offset is only an encoding aid, not a proved bound on
+                // the input. In particular, a valid signed i64 input plus the
+                // offset can exceed i64::MAX. Keep the exact integer here;
+                // only the range-checked limbs are converted back to Element.
                 let mut remaining_value = match self.table.table_sign() {
-                    TableSign::Mixed => value + self.offset,
-                    TableSign::Positive => value,
-                    TableSign::Negative => -value,
+                    TableSign::Mixed => value as i128 + self.offset as i128,
+                    TableSign::Positive => value as i128,
+                    TableSign::Negative => -(value as i128),
                 };
 
                 // Store the shifted chunks
-                let shift_chunk_mask = (1i64 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1;
+                let shift_chunk_mask = (1i128 << SHIFT_CHECK_TABLE_BIT_SIZE) - 1;
                 for (i, chunk_storage) in acc.shifted_chunks.iter_mut().enumerate() {
                     if i != self.number_of_shifted_chunks - 1
                         || self.right_shift.is_multiple_of(SHIFT_CHECK_TABLE_BIT_SIZE)
                     {
                         let chunk = remaining_value & shift_chunk_mask;
-                        chunk_storage.push(chunk);
+                        chunk_storage.push(chunk as Element);
                         remaining_value >>= SHIFT_CHECK_TABLE_BIT_SIZE;
                     } else {
                         let chunk_size = self.right_shift % SHIFT_CHECK_TABLE_BIT_SIZE;
-                        let chunk_mask = (1i64 << chunk_size) - 1;
+                        let chunk_mask = (1i128 << chunk_size) - 1;
                         let chunk = remaining_value & chunk_mask;
-                        chunk_storage.push(chunk * self.shifted_chunk_multiplier);
+                        chunk_storage
+                            .push((chunk * self.shifted_chunk_multiplier as i128) as Element);
                         remaining_value >>= chunk_size;
                     };
                 }
 
                 // Store the value chunks
-                let value_chunk_mask = (1i64 << self.value_chunk_size) - 1;
+                let value_chunk_mask = (1i128 << self.value_chunk_size) - 1;
                 for chunk_storage in acc.value_chunks.iter_mut() {
                     let value_chunk = remaining_value & value_chunk_mask;
                     let offset_value = match self.table.table_sign() {
-                        TableSign::Mixed => value_chunk - self.value_chunk_offset,
+                        TableSign::Mixed => value_chunk - self.value_chunk_offset as i128,
                         TableSign::Positive => value_chunk,
                         TableSign::Negative => -value_chunk,
                     };
-                    chunk_storage.push(offset_value);
+                    chunk_storage.push(offset_value as Element);
                     remaining_value >>= self.value_chunk_size;
                 }
 
                 // Store the zeroing chunks
-                let zero_chunk_mask = (1i64 << ZERO_CHECK_TABLE_BIT_SIZE) - 1;
+                let zero_chunk_mask = (1i128 << ZERO_CHECK_TABLE_BIT_SIZE) - 1;
                 for (i, chunk_storage) in acc.zeroing_chunks.iter_mut().enumerate() {
-                    let chunk = remaining_value & zero_chunk_mask;
                     if i != self.number_of_zeroing_chunks - 1 || !self.is_signed {
-                        chunk_storage.push(chunk);
+                        chunk_storage.push((remaining_value & zero_chunk_mask) as Element);
                     } else {
-                        chunk_storage.push(chunk - self.top_zeroing_chunk_offset);
+                        // This is the SIGNED top limb. Masking it first maps a
+                        // negative quotient such as -1 to 65535 and can also
+                        // discard nonzero high bits. The signed lookup checks
+                        // the exact quotient against its unchanged 16-bit
+                        // domain; reconstruction binds it to the original input.
+                        chunk_storage.push(
+                            (remaining_value - self.top_zeroing_chunk_offset as i128) as Element,
+                        );
                     }
                     remaining_value >>= ZERO_CHECK_TABLE_BIT_SIZE;
                 }
@@ -598,6 +608,254 @@ mod tests {
     use super::*;
     use ark_bn254::Fr as F;
     use proptest::prelude::*;
+
+    #[test]
+    fn qwen_lookup_signed_top_reproduces_65533_without_relaxing_range() -> Result<()> {
+        let table = Table::new(
+            TableType::Requantise,
+            1.0f32.to_bits(),
+            1.0f32.to_bits(),
+            14,
+        );
+        let info = ChunkingInfo::new(15, &table, 31, 1)?;
+        let rounded = -50_000i64 * 32768 + (1 << 14);
+        // The old unsigned mask turned an exact top quotient of -1 into
+        // 65535, then subtracted 2. This is the full-model failure value.
+        let old_top = (((rounded + info.offset) >> 29) & 65535) - info.top_zeroing_chunk_offset;
+        assert_eq!(old_top, 65533);
+        assert!(Table::new_signed_zero_check().lookup(old_top).is_err());
+        let inputs = [-50_000, -40_960, -32_769, -32_768, -1, 0, 32_767, 50_000]
+            .map(|x| x * 32768 + (1 << 14));
+        let chunks = info.decompose_input(inputs.to_vec());
+        assert_eq!(chunks.zeroing_chunks[0][0], -3);
+        let output = info.table_output(&chunks, &table)?;
+        assert_eq!(
+            info.combine_outputs(&output),
+            inputs
+                .iter()
+                .map(|x| table.lookup(x >> 15))
+                .collect::<Result<Vec<_>>>()?
+        );
+        for (i, &input) in inputs.iter().enumerate() {
+            let claim = info.combine_input_claims::<F>(
+                &chunks
+                    .shifted_chunks
+                    .iter()
+                    .map(|c| c[i].to_field())
+                    .collect::<Vec<_>>(),
+                &chunks
+                    .value_chunks
+                    .iter()
+                    .map(|c| c[i].to_field())
+                    .collect::<Vec<_>>(),
+                &chunks
+                    .zeroing_chunks
+                    .iter()
+                    .map(|c| c[i].to_field())
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(claim, input.to_field());
+        }
+        // The same signed 16-bit table still rejects either out-of-range side.
+        assert!(Table::new_signed_zero_check().lookup(-32769).is_err());
+        assert!(Table::new_signed_zero_check().lookup(32768).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_lookup_signed_top_handles_offset_overflow_exactly() -> Result<()> {
+        let table = Table::new(
+            TableType::Requantise,
+            1.0f32.to_bits(),
+            1.0f32.to_bits(),
+            14,
+        );
+        let info = ChunkingInfo::new(47, &table, 63, 1)?;
+        let input = (1i64 << 62) - 1;
+        assert!(input.checked_add(info.offset).is_none());
+        let inputs = [-(1i64 << 62), -1, 0, input];
+        let chunks = info.decompose_input(inputs.to_vec());
+        let output = info.table_output(&chunks, &table)?;
+        assert_eq!(
+            info.combine_outputs(&output),
+            inputs
+                .iter()
+                .map(|x| table.lookup(x >> 47))
+                .collect::<Result<Vec<_>>>()?
+        );
+        for (i, &input) in inputs.iter().enumerate() {
+            assert_eq!(
+                info.combine_input_claims::<F>(
+                    &chunks
+                        .shifted_chunks
+                        .iter()
+                        .map(|c| c[i].to_field())
+                        .collect::<Vec<_>>(),
+                    &chunks
+                        .value_chunks
+                        .iter()
+                        .map(|c| c[i].to_field())
+                        .collect::<Vec<_>>(),
+                    &chunks
+                        .zeroing_chunks
+                        .iter()
+                        .map(|c| c[i].to_field())
+                        .collect::<Vec<_>>(),
+                ),
+                input.to_field()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_lookup_silu16_output12_and_signed_clamp_complete_proofs() -> Result<()> {
+        use crate::{
+            ScalingFactor,
+            layers::{
+                Layer,
+                activation::{Activation, ActivationLayer, lookup_data::ActivationLookupData},
+                requant::Requant,
+            },
+            model::Model,
+            padding::pad_model,
+            testing::Pcs,
+        };
+        use dp_crypto::arkyper::transcript::blake3::Blake3Transcript;
+        use std::marker::PhantomData;
+        type P<'a, 'b> = crate::Prover<'a, 'b, F, Blake3Transcript, Pcs>;
+        let prove = |model: Model<Element>, inputs: Vec<Tensor<Element>>| -> Result<()> {
+            let model = pad_model(model)?;
+            let trace = model.run(model.prepare_inputs(inputs)?, &mut Default::default())?;
+            let (prover, verifier) = model.generate_contexts::<F, Pcs>()?;
+            let (proof, io) = P::prove(&prover, trace, &model)?;
+            crate::verify::<_, Blake3Transcript, _>(&verifier, proof.clone(), io.clone())?;
+            for port in 0..=io.input.len() {
+                let mut bad = io.clone();
+                let tensor = if port == bad.input.len() {
+                    &mut bad.output[0]
+                } else {
+                    &mut bad.input[port]
+                };
+                let mut data = tensor.data().to_vec();
+                data[0] = crate::SerializableField(*data[0] + F::from(1u64));
+                *tensor = Tensor::new_with_unpadded_shape(
+                    tensor.shape().clone(),
+                    tensor.unpadded_shape().clone(),
+                    data,
+                )?;
+                let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::verify::<_, Blake3Transcript, _>(&verifier, proof.clone(), bad)
+                }));
+                assert!(
+                    !matches!(rejected, Ok(Ok(()))),
+                    "accepted modified public port {port}"
+                );
+            }
+            let mut encoded = serde_json::to_value(&proof)?;
+            let requant = encoded["chunk_proofs"][0]["steps"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .find_map(|step| step.get_mut("Requant"))
+                .expect("the regression graph includes Requant");
+            let mut changed: crate::layers::requant::RequantProof<F, Pcs> =
+                serde_json::from_value(requant.clone())?;
+            changed.io_eval[0] += F::from(1u64);
+            *requant = serde_json::to_value(changed)?;
+            let corrupted = serde_json::from_value(encoded)?;
+            let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::verify::<_, Blake3Transcript, _>(&verifier, corrupted, io)
+            }));
+            assert!(
+                !matches!(rejected, Ok(Ok(()))),
+                "accepted modified committed lookup evaluation"
+            );
+            Ok(())
+        };
+        // Generic Requant contexts obtain this table from the process-wide
+        // BIT_LEN. Match it so the same regression also runs in default CI;
+        // ZKML_BIT_LEN=14 exercises the exact frozen full-model table.
+        let table = Table::new_requantise();
+        let scaling = ScalingFactor::from_absolute_max(1.0, None);
+        let requant = Requant {
+            output_scaling: scaling,
+            table,
+            activation_lookup_data: ActivationLookupData::new(15, 32768, 16, 0, table, false, 1),
+        };
+        let shape: Shape = vec![2, 4].into();
+        let mut model = Model::new_from_input_shapes(vec![shape.clone()]);
+        model.add_consecutive_layer(Layer::Requant(requant), None)?;
+        model.automatic_output_labelling()?;
+        prove(
+            model,
+            vec![Tensor::new(
+                shape.clone(),
+                vec![-50000, -40960, -32769, -1, 0, 32767, 40960, 50000],
+            )?],
+        )?;
+
+        // Exact frozen real-model N31 table and fixed-point parameters: a
+        // 16-bit SiLU input table whose complete output lies in signed 12 bits.
+        let silu_table =
+            Table::new_silu(f32::from_bits(1158775787), f32::from_bits(1125219172), 16);
+        for x in -32768..=32767 {
+            assert!((-2048..=2047).contains(&silu_table.lookup(x)?));
+        }
+        let lookup = ActivationLookupData::new(28, 28165, 37, 0, silu_table, true, 1);
+        let activation = Activation::GLU(ActivationLayer::Silu(Some(lookup), PhantomData));
+        let mut model = Model::new_from_input_shapes(vec![shape.clone(); 2]);
+        let id = model.add_consecutive_layer(Layer::Activation(activation), None)?;
+        // Exact frozen first FFN GLU requantization parameters (N720).
+        model.add_consecutive_layer(
+            Layer::Requant(Requant {
+                output_scaling: scaling,
+                table,
+                activation_lookup_data: ActivationLookupData::new(
+                    36, 22116, 48, 0, table, false, 1,
+                ),
+            }),
+            Some(id),
+        )?;
+        model.automatic_output_labelling()?;
+        let gate = Tensor::new(
+            shape.clone(),
+            vec![
+                -5 * (1i64 << 36),
+                -(1i64 << 36),
+                -1,
+                0,
+                1,
+                1 << 25,
+                1 << 34,
+                (1 << 36) - 1,
+            ],
+        )?;
+        let up = Tensor::new(
+            shape,
+            vec![
+                1 << 35,
+                -(1 << 35),
+                -7,
+                8,
+                -9,
+                -(1 << 35),
+                1 << 35,
+                -(1 << 35),
+            ],
+        )?;
+        let witness = lookup.get_lookup_witness(gate.clone())?;
+        let witness_output =
+            crate::lookup::operation::lookup_test_utils::compute_unpadded_witness_output(
+                &lookup,
+                gate.shape(),
+                &witness,
+                &silu_table,
+            )?;
+        let numerical_output = lookup.evaluate(gate.as_wrapped())?.get_data();
+        assert_eq!(witness_output.data(), &numerical_output);
+        prove(model, vec![gate, up])
+    }
 
     impl ChunkingInfo {
         /// This function recombines the decomposed values back into their shifted form for testing purposes.

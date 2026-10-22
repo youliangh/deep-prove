@@ -28,12 +28,31 @@ use std::{
 use tracing::{debug, info_span, trace};
 use utils::Metrics;
 
+/// Fiat–Shamir statement policy fixed by the trusted setup context.
+/// Legacy is accepted only by explicit old-artifact decoders, never selected by
+/// a proof. Every newly generated setup binds the complete public IO.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProofProtocol {
+    LegacyV1,
+    #[default]
+    PublicIoV2,
+}
+
+impl ProofProtocol {
+    pub(crate) fn write_domain<T: Transcript>(self, transcript: &mut T) {
+        if self == Self::PublicIoV2 {
+            transcript.append_bytes(b"deep-prove/public-io/v2");
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "F: ark_serialize::CanonicalSerialize",
     deserialize = "F: ark_serialize::CanonicalDeserialize"
 ))]
 pub struct ProverContext<'a, F: PrimeField, PCS: CommitmentScheme> {
+    pub(crate) protocol: ProofProtocol,
     /// Information about each steps of the model. That's the information that the verifier
     /// needs to know from the setup to avoid the prover being able to cheat.
     /// in REVERSED order already since proving goes from last layer to first layer.
@@ -46,6 +65,11 @@ pub struct ProverContext<'a, F: PrimeField, PCS: CommitmentScheme> {
 
 impl<'a, F: PrimeField, PCS: CommitmentScheme<Field = F>> ProverContext<'a, F, PCS> {
     pub fn write_to_transcript<T: Transcript>(&self, t: &mut T) -> anyhow::Result<()> {
+        ensure!(
+            self.protocol == ProofProtocol::PublicIoV2,
+            "Legacy proving is disabled"
+        );
+        self.protocol.write_domain(t);
         self.commitment_ctx.write_to_transcript(t);
         Ok(())
     }
@@ -73,6 +97,7 @@ impl<'a, F: PrimeField, PCS: CommitmentScheme<Field = F>> ProverContext<'a, F, P
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct VerifierContext<F: PrimeField, PCS: CommitmentScheme> {
+    pub(crate) protocol: ProofProtocol,
     /// Information about each steps of the model. That's the information that the verifier
     /// needs to know from the setup to avoid the prover being able to cheat.
     /// in REVERSED order already since proving goes from last layer to first layer.
@@ -85,6 +110,7 @@ pub struct VerifierContext<F: PrimeField, PCS: CommitmentScheme> {
 
 impl<F: PrimeField, PCS: CommitmentScheme> VerifierContext<F, PCS> {
     pub fn write_to_transcript<T: Transcript>(&self, t: &mut T) -> anyhow::Result<()> {
+        self.protocol.write_domain(t);
         self.commitment_ctx.write_to_transcript(t);
         Ok(())
     }
@@ -216,12 +242,14 @@ impl Model<Element> {
         let (prover_ctx, verifier_ctx) = commitment_ctx.generate_contexts()?;
 
         let prover_ctx = ProverContext {
+            protocol: ProofProtocol::default(),
             model_ctx: step_info.clone(),
             commitment_ctx: prover_ctx,
             lookup: lookup.clone(),
         };
 
         let verifier_ctx = VerifierContext {
+            protocol: ProofProtocol::default(),
             model: step_info,
             commitment_ctx: verifier_ctx,
             lookup,
@@ -249,12 +277,14 @@ impl Model<Element> {
         debug!("Building all contexts");
         let (commit_prover_ctx, commit_verifier_ctx) = commitment_ctx.generate_contexts()?;
         let prover_context = ProverContext {
+            protocol: ProofProtocol::default(),
             model_ctx: steps_info.clone(),
             commitment_ctx: commit_prover_ctx,
             lookup: lookup.clone(),
         };
 
         let verifier_context = VerifierContext {
+            protocol: ProofProtocol::default(),
             model: steps_info,
             commitment_ctx: commit_verifier_ctx,
             lookup,

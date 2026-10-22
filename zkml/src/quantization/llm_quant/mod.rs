@@ -9,6 +9,7 @@ use anyhow::Result;
 pub mod gemma3;
 pub mod gpt2;
 pub mod llama3;
+pub mod qwen35;
 pub mod rotation;
 
 pub trait FPTransformModel {
@@ -266,7 +267,11 @@ mod tests {
         let embedding_size = new_driver.md.config.hidden_size;
 
         for (block_number, transformer_metadata) in new_driver.md.transformers.iter().enumerate() {
-            let softmax_id = transformer_metadata.transformer.softmax_id;
+            let softmax_id = transformer_metadata
+                .transformer
+                .as_ref()
+                .expect("softmax attention metadata")
+                .softmax_id;
             let int_softmax = new_trace.get_step(&softmax_id).unwrap();
             let dequant_softmax_padded = int_softmax
                 .to_dequantize(&model_metadata, softmax_id)?
@@ -310,7 +315,11 @@ mod tests {
                 "First 10 Softmax Output Dequant: {:?}",
                 &dequant_softmax_output.data()[0..10]
             );
-            let qkv_id = transformer_metadata.transformer.qkv_id;
+            let qkv_id = transformer_metadata
+                .transformer
+                .as_ref()
+                .expect("softmax attention metadata")
+                .qkv_id;
             let int_qkv = new_trace.get_step(&qkv_id).unwrap();
             let dequant_qkv_padded = int_qkv
                 .to_dequantize(&model_metadata, qkv_id)?
@@ -357,7 +366,11 @@ mod tests {
             println!("QKV input original: {:?}", &float_qkv.data()[0..10]);
             println!("QKV input dequant: {:?}", &dequant_qkv.data()[0..10]);
 
-            let qkt_id = transformer_metadata.transformer.qkt_id;
+            let qkt_id = transformer_metadata
+                .transformer
+                .as_ref()
+                .expect("softmax attention metadata")
+                .qkt_id;
             let float_qkt_step = trace.get_step(&qkt_id).unwrap();
             let float_q = float_qkt_step.input_tensors()?[0].clone();
             let float_k = float_qkt_step.input_tensors()?[1].clone();
@@ -420,7 +433,11 @@ mod tests {
             println!("QKT input original K: {:?}", &float_k.data()[0..10]);
             println!("QKT input dequant K: {:?}", &dequant_k.data()[0..10]);
             println!("--- End QKT Inputs ---");
-            let attention_values = transformer_metadata.transformer.residual_id;
+            let attention_values = transformer_metadata
+                .transformer
+                .as_ref()
+                .expect("softmax attention metadata")
+                .residual_id;
             let float_attn_values_step = trace.get_step(&attention_values).unwrap();
             let float_attn_values = float_attn_values_step.input_tensors()?[1].clone();
             let int_attn_values = new_trace.get_step(&attention_values).unwrap();

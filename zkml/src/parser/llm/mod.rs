@@ -168,6 +168,7 @@ impl<T: LayerInsertion<Metadata = TransformerMetadata>> LLMIR<T> {
         model.automatic_output_labelling()?;
         let metadata = LLMMetadata {
             config: llm_config,
+            additional_eos_tokens: Vec::new(),
             transformers,
             embeddings: embeddings_id,
             positional: positional_id,

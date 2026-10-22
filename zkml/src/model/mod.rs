@@ -35,6 +35,7 @@ use tracing::{info, info_span, warn};
 pub(crate) mod context;
 pub mod exec_graph;
 pub mod llm;
+pub mod llm_artifact;
 pub(crate) mod trace;
 pub mod transform;
 pub use context::{ContextGraph, ModelCtx};

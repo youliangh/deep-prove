@@ -13,6 +13,7 @@
 //!   conventions are handled by higher-level code.
 
 use std::{
+    collections::BTreeMap,
     fmt::Display,
     fs::File,
     io::Read,
@@ -53,6 +54,26 @@ impl RawSafeTensors {
             tokenizer: tokenizer.as_ref().to_path_buf(),
             config: config.as_ref().to_path_buf(),
         }
+    }
+
+    /// Resolve a local Hugging Face checkpoint, including indexed shards.
+    pub fn from_directory(directory: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let directory = directory.as_ref();
+        let model = if directory.join("model.safetensors.index.json").is_file() {
+            directory.join("model.safetensors.index.json")
+        } else {
+            directory.join("model.safetensors")
+        };
+        let tokenizer = directory.join("tokenizer.json");
+        let config = directory.join("config.json");
+        for path in [&model, &tokenizer, &config] {
+            anyhow::ensure!(
+                path.is_file(),
+                "Missing local model file: {}",
+                path.display()
+            );
+        }
+        Ok(Self::new(model, tokenizer, config))
     }
     /// Download required files from a Hugging Face repo id (e.g., "google/gemma-3-270m-it")
     /// into `destination_folder` and return a `RawSafeTensors` pointing at them.
@@ -272,6 +293,7 @@ pub struct FileTensorLoader {
     /// Entire file contents held in memory to satisfy the borrowing
     /// requirements of `safetensors::SafeTensors` views.
     bytes: Arc<Vec<u8>>,
+    indexed_tensors: Option<Arc<BTreeMap<String, FileTensorLoader>>>,
     /// Current prefix for tensor names. Appended in front of requested keys.
     current_prefix: String,
 }
@@ -279,17 +301,70 @@ pub struct FileTensorLoader {
 impl FileTensorLoader {
     /// Build a loader from a file path.
     pub fn from_path<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let mut f = File::open(path.as_ref()).with_context(|| {
-            format!(
-                "Failed to open SafeTensors file: {}",
-                path.as_ref().display()
-            )
-        })?;
+        let path = path.as_ref();
+        if path.is_dir() {
+            return RawSafeTensors::from_directory(path)?.loader();
+        }
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            return Self::from_index(path);
+        }
+        let mut f = File::open(path)
+            .with_context(|| format!("Failed to open SafeTensors file: {}", path.display()))?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes)
             .with_context(|| "Failed to read SafeTensors file")?;
         Ok(Self {
             bytes: Arc::new(bytes),
+            indexed_tensors: None,
+            current_prefix: String::new(),
+        })
+    }
+
+    fn from_index(path: &Path) -> anyhow::Result<Self> {
+        #[derive(serde::Deserialize)]
+        struct Index {
+            weight_map: BTreeMap<String, String>,
+        }
+        let index: Index =
+            serde_json::from_reader(File::open(path)?).context("Invalid SafeTensors index")?;
+        anyhow::ensure!(
+            !index.weight_map.is_empty(),
+            "SafeTensors index has no tensors"
+        );
+        let directory = path
+            .parent()
+            .context("SafeTensors index has no parent directory")?;
+        let mut shards = BTreeMap::new();
+        let mut tensors = BTreeMap::new();
+        for (name, shard) in index.weight_map {
+            let relative = Path::new(&shard);
+            anyhow::ensure!(
+                relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+                "SafeTensors shard must be a relative file path: {shard}"
+            );
+            anyhow::ensure!(
+                relative
+                    .extension()
+                    .is_some_and(|extension| extension == "safetensors"),
+                "Indexed shard must be a SafeTensors file: {shard}"
+            );
+            if !shards.contains_key(&shard) {
+                shards.insert(shard.clone(), Self::from_path(directory.join(&shard))?);
+            }
+            let loader = shards.get(&shard).expect("loaded shard").clone();
+            loader
+                .get_tensor_shape(&name)
+                .with_context(|| format!("Index tensor {name} missing from {shard}"))?;
+            tensors.insert(name, loader);
+        }
+        Ok(Self {
+            bytes: Arc::new(Vec::new()),
+            indexed_tensors: Some(Arc::new(tensors)),
             current_prefix: String::new(),
         })
     }
@@ -314,6 +389,7 @@ impl FileTensorLoader {
     pub fn pp(&self, prefix_extension: &str) -> Self {
         Self {
             bytes: Arc::clone(&self.bytes),
+            indexed_tensors: self.indexed_tensors.clone(),
             current_prefix: format!("{}{}", self.current_prefix, prefix_extension),
         }
     }
@@ -321,6 +397,12 @@ impl FileTensorLoader {
     /// Return the shape of a tensor without materializing it.
     pub fn get_tensor_shape(&self, name: &str) -> anyhow::Result<Shape> {
         let full = self.full_name(name);
+        if let Some(tensors) = &self.indexed_tensors {
+            return tensors
+                .get(&full)
+                .with_context(|| format!("tensor not indexed: {full}"))?
+                .get_tensor_shape(&full);
+        }
         let st = self.deserialize()?;
         let view = st
             .tensor(&full)
@@ -331,6 +413,12 @@ impl FileTensorLoader {
     /// Load a tensor and convert to `Tensor<f32>` (supports F32/F16/BF16).
     pub fn get_tensor(&self, name: &str) -> anyhow::Result<KeyedTensor<f32>> {
         let full = self.full_name(name);
+        if let Some(tensors) = &self.indexed_tensors {
+            return tensors
+                .get(&full)
+                .with_context(|| format!("tensor not indexed: {full}"))?
+                .get_tensor(&full);
+        }
         let st = self.deserialize()?;
         let view = st
             .tensor(&full)
@@ -362,6 +450,9 @@ impl FileTensorLoader {
 
     /// List sorted metadata keys and tensor keys for inspection/debugging.
     pub fn meta_and_tensor_keys(&self) -> (Vec<String>, Vec<String>) {
+        if let Some(tensors) = &self.indexed_tensors {
+            return (Vec::new(), tensors.keys().cloned().collect());
+        }
         let header = match self.header_json() {
             Ok(h) => h,
             Err(_) => return (vec![], vec![]),
@@ -539,10 +630,70 @@ impl RMSNorm<f32> {
 }
 
 #[cfg(test)]
+#[path = "qwen35_loader_tests.rs"]
+mod qwen35_loader_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::{init_test_logging, parser::llm::models::gemma3::safe_tests::GEMMA3_SAFE_MODEL};
 
     use super::*;
+
+    fn write_tiny_shard(path: &Path, name: &str, values: &[f32]) -> anyhow::Result<()> {
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let view = TensorView::new(Dtype::F32, vec![values.len()], &bytes)?;
+        safetensors::tensor::serialize_to_file([(name, view)], None, path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_safe_loader_resolves_multiple_shards_and_prefixes() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        write_tiny_shard(
+            &directory.path().join("first.safetensors"),
+            "model.first",
+            &[1.0, 2.0],
+        )?;
+        write_tiny_shard(
+            &directory.path().join("second.safetensors"),
+            "model.second",
+            &[3.0, 4.0],
+        )?;
+        let index = directory.path().join("model.safetensors.index.json");
+        std::fs::write(
+            &index,
+            serde_json::to_vec(&serde_json::json!({"weight_map": {
+            "model.first":"first.safetensors", "model.second":"second.safetensors"}}))?,
+        )?;
+        let loader = FileTensorLoader::from_path(&index)?.pp("model.");
+        assert_eq!(loader.get_tensor("first")?.data(), &[1.0, 2.0]);
+        assert_eq!(loader.get_tensor("second")?.data(), &[3.0, 4.0]);
+        assert_eq!(loader.get_tensor_shape("second")?, Shape::from(vec![2]));
+        assert!(loader.get_tensor("missing").is_err());
+        assert_eq!(loader.meta_and_tensor_keys().1.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_safe_loader_rejects_missing_and_external_shards() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let index = directory.path().join("model.safetensors.index.json");
+        for name in [
+            "missing.safetensors",
+            "../external.safetensors",
+            "/tmp/external.safetensors",
+        ] {
+            std::fs::write(
+                &index,
+                serde_json::to_vec(&serde_json::json!({"weight_map":{"x":name}}))?,
+            )?;
+            assert!(FileTensorLoader::from_path(&index).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_safe_file_tensor_loader() -> anyhow::Result<()> {

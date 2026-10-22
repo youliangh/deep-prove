@@ -82,6 +82,30 @@ impl ActivationLookupData {
                     0,
                 )
             }
+            ActivationLayer::Sigmoid(..)
+            | ActivationLayer::Softplus(..)
+            | ActivationLayer::ExpNegative(..) => {
+                use crate::lookup::table::TableType;
+                let operation = match operation {
+                    ActivationLayer::Sigmoid(..) => TableType::Sigmoid,
+                    ActivationLayer::Softplus(..) => TableType::Softplus,
+                    ActivationLayer::ExpNegative(..) => TableType::ExpNegative,
+                    _ => unreachable!(),
+                };
+                let table = Table::new(
+                    operation,
+                    table_input_scaling.scale().recip().to_bits(),
+                    table_output_scaling.scale().recip().to_bits(),
+                    table_input_scaling.bit_size() + 1,
+                );
+                // Lookup padding is an INPUT value, before fixed-point rescaling.
+                // Nonzero f(0) is accounted for by the public output-claim mask.
+                (
+                    input_scaling.scale() / table_input_scaling.scale(),
+                    table,
+                    0,
+                )
+            }
         };
 
         let intermediate_bit_size = input_scaling.bit_size() + 1;
@@ -121,8 +145,42 @@ impl ActivationLookupData {
         self.is_glu = is_glu;
     }
 
+    /// Link the zero-padded layer output to lookup witnesses whose padded slots
+    /// contain f(0). The correction is determined by the public shape and table,
+    /// so it introduces no unchecked witness. GLU already multiplies these slots
+    /// by its zero-padded second input and therefore needs no correction.
+    pub(crate) fn lookup_output_claim<F: PrimeField>(
+        &self,
+        claim: &Claim<F>,
+        unpadded_shape: &Shape,
+    ) -> Result<Claim<F>> {
+        use crate::{lookup::operation::compute_lookup_padding_evaluation, quantization::ToField};
+        if self.is_glu {
+            return Ok(claim.clone());
+        }
+        let zero_output = self.table.lookup(0)?;
+        if zero_output == 0 {
+            return Ok(claim.clone());
+        }
+        let padded_shape = unpadded_shape.next_power_of_two();
+        let dim_points = padded_shape.split_point(claim.point())?;
+        let padding =
+            compute_lookup_padding_evaluation(zero_output.to_field(), unpadded_shape, &dim_points)?;
+        Ok(Claim::new(
+            claim.point().to_vec(),
+            claim.evaluation() + padding,
+        ))
+    }
+
     pub fn evaluate(&self, input: WrappedTensor<Element>) -> Result<WrappedTensor<Element>> {
-        if self.value_chunks == 1 {
+        let shape = Shape::from(input.shape());
+        let zero_padding = self.table.lookup(0)? != 0 && input.shape() != *input.unpadded_shape();
+        let input = if zero_padding {
+            input.reduce_to_unpadded_shape()?
+        } else {
+            input
+        };
+        let result = if self.value_chunks == 1 {
             let table = &self.table;
             self.apply(input, table)
         } else {
@@ -133,6 +191,13 @@ impl ActivationLookupData {
                 self.table.table_bit_size() * self.value_chunks,
             );
             self.apply(input, &table)
+        }?;
+        if zero_padding {
+            let mut tensor = Tensor::try_from(result)?;
+            tensor.pad_to_shape(shape)?;
+            WrappedTensor::try_from(tensor)
+        } else {
+            Ok(result)
         }
     }
 

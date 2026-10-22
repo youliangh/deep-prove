@@ -57,6 +57,7 @@ The recommended path is **SafeTensors via Hugging Face**: pass `--hf <model-id>`
 | **Gemma 3** | `--hf google/gemma-3-1b-it` | SafeTensors only |
 | **Llama 2** | `--hf meta-llama/Llama-2-7b-hf` | SafeTensors only. `--accuracy` mode currently falls back to default quantization for Llama 2 |
 | **Llama 3 / 3.2** | `--model llama3 --hf-dir /path/to/local/model` | SafeTensors; grouped-query attention, tied embeddings and Llama 3 scaled RoPE. Calibrated integer inference is always enabled. |
+| **Qwen3.5-0.8B (text)** | `--model qwen35 --hf-dir /path/to/local/model` | Hybrid Gated DeltaNet and full attention; use the explicit quantization configuration and validation workflow in the [Qwen3.5 guide](docs/qwen35.md). |
 
 Supported transformer layers:
 

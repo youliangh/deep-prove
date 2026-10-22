@@ -332,6 +332,7 @@ mod activation_precision_tests {
         let activation_id = NodeId::from(14);
         let unused = NodeId::from(0);
         let metadata = LLMMetadata {
+            additional_eos_tokens: Vec::new(),
             config: LLMConfig {
                 model_name: "llama3".into(),
                 embedding_size: 2048,
@@ -347,14 +348,15 @@ mod activation_precision_tests {
             },
             transformers: vec![TransformerMetadata {
                 norm_id: unused,
-                transformer: AttentionMetadata {
+                transformer: Some(AttentionMetadata {
                     qkv_id: unused,
                     qkt_id: unused,
                     mask_id: unused,
                     softmax_id: unused,
                     residual_id: unused,
                     final_proj_id: unused,
-                },
+                }),
+                linear_attention: None,
                 ffn: FFNGraphID {
                     up_id: unused,
                     down_id: unused,

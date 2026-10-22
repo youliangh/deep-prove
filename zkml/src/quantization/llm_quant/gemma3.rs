@@ -41,7 +41,13 @@ impl FPTransformModel for Gemma3 {
         for transformer_metadata in md.transformers.iter() {
             let Layer::EinSum(qkv_einsum) = norm_adapted_model
                 .graph_mut()
-                .node_mut(transformer_metadata.transformer.qkv_id)
+                .node_mut(
+                    transformer_metadata
+                        .transformer
+                        .as_ref()
+                        .expect("softmax attention metadata")
+                        .qkv_id,
+                )
                 .ok_or(anyhow!("No QKV Einsum node for model"))?
                 .as_inner_mut()
                 .ok_or(anyhow!("Couldn't get inner QKV Einsum node"))?
@@ -53,7 +59,13 @@ impl FPTransformModel for Gemma3 {
 
             let Layer::EinSum(final_proj_einsum) = norm_adapted_model
                 .graph_mut()
-                .node_mut(transformer_metadata.transformer.final_proj_id)
+                .node_mut(
+                    transformer_metadata
+                        .transformer
+                        .as_ref()
+                        .expect("softmax attention metadata")
+                        .final_proj_id,
+                )
                 .ok_or(anyhow!("No Final Projection Einsum node for model"))?
                 .as_inner_mut()
                 .ok_or(anyhow!("Couldn't get inner Final Projection Einsum node"))?
@@ -68,7 +80,11 @@ impl FPTransformModel for Gemma3 {
             let output_norm_node = norm_adapted_model
                 .graph()
                 .neighbors(
-                    transformer_metadata.transformer.final_proj_id,
+                    transformer_metadata
+                        .transformer
+                        .as_ref()
+                        .expect("softmax attention metadata")
+                        .final_proj_id,
                     Direction::Outgoing,
                 )
                 .map(|(_, edge)| edge.target())

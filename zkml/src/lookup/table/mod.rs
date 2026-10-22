@@ -146,9 +146,12 @@ impl Table {
         match self.operation {
             // Unwrap is safe here because all table operations should be able to handle their max input value
             TableType::Exp
+            | TableType::ExpNegative
             | TableType::ReLU
             | TableType::GeLU
             | TableType::SiLU
+            | TableType::Sigmoid
+            | TableType::Softplus
             | TableType::Requantise
             | TableType::ShiftCheck
             | TableType::SignedZeroCheck => self
@@ -171,9 +174,12 @@ impl Table {
         match self.operation {
             // Unwrap is safe here because all table operations should be able to handle their minimum input value
             TableType::Exp
+            | TableType::ExpNegative
             | TableType::ReLU
             | TableType::GeLU
             | TableType::SiLU
+            | TableType::Sigmoid
+            | TableType::Softplus
             | TableType::Requantise
             | TableType::ShiftCheck
             | TableType::SignedZeroCheck => self

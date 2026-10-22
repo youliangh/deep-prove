@@ -27,6 +27,7 @@ pub use context::ProverContext;
 pub mod prover;
 pub mod prover_graph;
 pub mod same_poly;
+pub(crate) mod statement;
 pub mod verifier;
 
 /// Contains the additional data produced for each proving chunk, and needed by the verifier

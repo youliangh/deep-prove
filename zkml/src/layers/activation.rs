@@ -64,6 +64,9 @@ pub enum ActivationLayer<N> {
     Relu(Option<ActivationLookupData>, PhantomData<N>),
     Gelu(Option<ActivationLookupData>, PhantomData<N>),
     Silu(Option<ActivationLookupData>, PhantomData<N>),
+    Sigmoid(Option<ActivationLookupData>, PhantomData<N>),
+    Softplus(Option<ActivationLookupData>, PhantomData<N>),
+    ExpNegative(Option<ActivationLookupData>, PhantomData<N>),
 }
 
 impl<N> ActivationLayer<N> {
@@ -72,6 +75,9 @@ impl<N> ActivationLayer<N> {
             ActivationLayer::Relu(_, _) => "RELU_IN".to_string(),
             ActivationLayer::Gelu(_, _) => "GELU_IN".to_string(),
             ActivationLayer::Silu(_, _) => "SILU_IN".to_string(),
+            ActivationLayer::Sigmoid(_, _) => "SIGMOID_IN".to_string(),
+            ActivationLayer::Softplus(_, _) => "SOFTPLUS_IN".to_string(),
+            ActivationLayer::ExpNegative(_, _) => "EXP_NEG_IN".to_string(),
         }
     }
 
@@ -80,6 +86,9 @@ impl<N> ActivationLayer<N> {
             ActivationLayer::Relu(_, _) => "RELU_OUT".to_string(),
             ActivationLayer::Gelu(_, _) => "GELU_OUT".to_string(),
             ActivationLayer::Silu(_, _) => "SILU_OUT".to_string(),
+            ActivationLayer::Sigmoid(_, _) => "SIGMOID_OUT".to_string(),
+            ActivationLayer::Softplus(_, _) => "SOFTPLUS_OUT".to_string(),
+            ActivationLayer::ExpNegative(_, _) => "EXP_NEG_OUT".to_string(),
         }
     }
 }
@@ -146,6 +155,19 @@ impl<N> Activation<N> {
         Self::Plain(ActivationLayer::<N>::Silu(None, PhantomData))
     }
 
+    pub fn new_sigmoid() -> Self {
+        Self::Plain(ActivationLayer::<N>::Sigmoid(None, PhantomData))
+    }
+
+    pub fn new_softplus() -> Self {
+        Self::Plain(ActivationLayer::<N>::Softplus(None, PhantomData))
+    }
+
+    /// Exponential on nonpositive inputs, used for recurrent decay gates.
+    pub fn new_exp_negative() -> Self {
+        Self::Plain(ActivationLayer::<N>::ExpNegative(None, PhantomData))
+    }
+
     /// Returns a Gated SiLU (SwiGLU).
     pub fn new_swiglu() -> Self {
         Self::GLU(ActivationLayer::<N>::Silu(None, PhantomData))
@@ -205,6 +227,31 @@ impl ActivationLayer<f32> {
                 .iter()
                 .map(|input| WrappedTensor::silu((*input).clone()))
                 .collect::<Vec<_>>()),
+            ActivationLayer::Sigmoid(..)
+            | ActivationLayer::Softplus(..)
+            | ActivationLayer::ExpNegative(..) => inputs
+                .iter()
+                .map(|input| {
+                    let shape = Shape::from(input.shape());
+                    let unpadded_shape = Shape::from(input.unpadded_shape());
+                    let input = (*input).clone().reduce_to_unpadded_shape()?;
+                    let values = input
+                        .get_data()
+                        .into_iter()
+                        .map(|x| match self {
+                            ActivationLayer::Sigmoid(..) => crate::lookup::table::sigmoid_float(x),
+                            ActivationLayer::Softplus(..) => {
+                                crate::lookup::table::softplus_float(x)
+                            }
+                            ActivationLayer::ExpNegative(..) => x.min(0.0).exp(),
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let mut tensor = Tensor::new(unpadded_shape, values)?;
+                    tensor.pad_to_shape(shape)?;
+                    WrappedTensor::try_from(&tensor)
+                })
+                .collect(),
         }
     }
 
@@ -247,6 +294,18 @@ impl ActivationLayer<f32> {
                 ActivationLayer::<Element>::Silu(Some(activation_lookup_data), PhantomData),
                 vec![table_output_scaling],
             )),
+            ActivationLayer::Sigmoid(..) => Ok(QuantizeOutput::new(
+                ActivationLayer::<Element>::Sigmoid(Some(activation_lookup_data), PhantomData),
+                vec![table_output_scaling],
+            )),
+            ActivationLayer::Softplus(..) => Ok(QuantizeOutput::new(
+                ActivationLayer::<Element>::Softplus(Some(activation_lookup_data), PhantomData),
+                vec![table_output_scaling],
+            )),
+            ActivationLayer::ExpNegative(..) => Ok(QuantizeOutput::new(
+                ActivationLayer::<Element>::ExpNegative(Some(activation_lookup_data), PhantomData),
+                vec![table_output_scaling],
+            )),
         }
     }
 }
@@ -256,7 +315,10 @@ impl ActivationLayer<Element> {
         match self {
             ActivationLayer::Relu(Some(data), ..)
             | ActivationLayer::Gelu(Some(data), ..)
-            | ActivationLayer::Silu(Some(data), ..) => data,
+            | ActivationLayer::Silu(Some(data), ..)
+            | ActivationLayer::Sigmoid(Some(data), ..)
+            | ActivationLayer::Softplus(Some(data), ..)
+            | ActivationLayer::ExpNegative(Some(data), ..) => data,
             _ => panic!("Activation layer lookup data not initialized"),
         }
     }
@@ -265,7 +327,10 @@ impl ActivationLayer<Element> {
         match self {
             ActivationLayer::Relu(Some(data), ..)
             | ActivationLayer::Gelu(Some(data), ..)
-            | ActivationLayer::Silu(Some(data), ..) => {
+            | ActivationLayer::Silu(Some(data), ..)
+            | ActivationLayer::Sigmoid(Some(data), ..)
+            | ActivationLayer::Softplus(Some(data), ..)
+            | ActivationLayer::ExpNegative(Some(data), ..) => {
                 data.set_glu(is_glu);
             }
             _ => unreachable!("ActivationLayer Element lookup data not initialized"),
@@ -294,11 +359,18 @@ impl ActivationLayer<Element> {
                     ],
                 }
             }
-            false => vec![
-                Table::new_shift_check(),
-                value_table,
-                Table::new_zero_check(),
-            ],
+            false => {
+                let mut tables = vec![Table::new_shift_check(), value_table];
+                if lookup_data
+                    .chunking_info(&value_table)
+                    .unwrap()
+                    .number_of_zeroing_chunks()
+                    > 0
+                {
+                    tables.push(Table::new_zero_check());
+                }
+                tables
+            }
         }
     }
 
@@ -357,6 +429,9 @@ impl<N> OpInfo for Activation<N> {
             ActivationLayer::Relu(..) => "ReLU".to_string(),
             ActivationLayer::Gelu(..) => "GeLU".to_string(),
             ActivationLayer::Silu(..) => "SiLU".to_string(),
+            ActivationLayer::Sigmoid(..) => "Sigmoid".to_string(),
+            ActivationLayer::Softplus(..) => "Softplus".to_string(),
+            ActivationLayer::ExpNegative(..) => "ExpNegative".to_string(),
         }
     }
 
@@ -631,13 +706,16 @@ impl Activation<Element> {
     {
         let lookup_op = self.activation_type().get_lookup_data();
 
+        let lookup_claim =
+            lookup_op.lookup_output_claim(last_claim, step.inputs()[0].unpadded_shape())?;
+
         let LookupProverResult {
             generic_proof,
             input_claims,
             ..
         } = prove_lookup_op(
             lookup_op,
-            last_claim,
+            &lookup_claim,
             step,
             &lookup_op.table,
             None,
@@ -692,9 +770,11 @@ impl ActivationCtx {
             shift_evaluations: None,
         };
         let lookup_op = self.op.activation_type().get_lookup_data();
+        let lookup_claim =
+            lookup_op.lookup_output_claim(last_claim, &shape_step.unpadded_output_shape[0])?;
         let LookupVerifyResult { input_claims, .. } = verify_lookup_op(
             lookup_op,
-            last_claim,
+            &lookup_claim,
             shape_step,
             &lookup_op.table,
             &generic_lookup_proof,
@@ -849,6 +929,115 @@ mod test {
         model.add_consecutive_layer(Layer::Activation(Activation::new_swiglu()), None)?;
         model.automatic_output_labelling()?;
         prove_model(model, &mut Default::default()).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_gate_activations_match_stable_scalar_reference() -> anyhow::Result<()> {
+        let values = vec![-100.0, -20.0, -1.0, 0.0, 1.0, 20.0, 100.0];
+        let input = Tensor::new(vec![7].into(), values.clone())?;
+        for (kind, activation) in [Activation::new_sigmoid(), Activation::new_softplus()]
+            .into_iter()
+            .enumerate()
+        {
+            let result = activation.evaluate(&[&input.as_wrapped()])?.outputs[0].get_data();
+            for (&x, &actual) in values.iter().zip(&result) {
+                let x = x as f64;
+                let expected = if kind == 0 {
+                    1.0 / (1.0 + (-x).exp())
+                } else {
+                    x.max(0.0) + (-x.abs()).exp().ln_1p()
+                } as f32;
+                assert!(actual.is_finite());
+                assert!((actual - expected).abs() <= 2e-6 * expected.abs().max(1.0));
+            }
+        }
+        let input = Tensor::new(vec![5].into(), vec![-100.0, -20.0, -1.0, -0.001, 0.0])?;
+        let result = Activation::new_exp_negative()
+            .evaluate(&[&input.as_wrapped()])?
+            .outputs[0]
+            .get_data();
+        for (&x, &actual) in input.data().iter().zip(&result) {
+            assert!(actual.is_finite() && (0.0..=1.0).contains(&actual));
+            assert!((actual - (x as f64).exp() as f32).abs() <= 1e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_gate_activations_prove_real_lookup_paths() -> anyhow::Result<()> {
+        use crate::model::test::prove_model_with;
+        for (i, activation) in [
+            Activation::new_sigmoid(),
+            Activation::new_softplus(),
+            Activation::new_exp_negative(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let values = if i == 2 {
+                vec![-8.0, -2.0, -0.25, 0.0, -1.0, -0.5]
+            } else {
+                vec![-8.0, -2.0, -0.25, 0.0, 1.0, 8.0]
+            };
+            for shape in [vec![2, 3], vec![3, 3, 3]] {
+                let data = values
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(shape.iter().product())
+                    .collect();
+                let input = Tensor::new(shape.into(), data)?;
+                let mut model = Model::new_from_input_shapes(vec![input.shape().clone()]);
+                model.add_consecutive_layer(Layer::Activation(activation.clone()), None)?;
+                model.automatic_output_labelling()?;
+                prove_model_with(model, vec![input], &mut Default::default())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_gate_padding_is_zero_in_float_and_quantized_outputs() -> anyhow::Result<()> {
+        use crate::model::test::quantize_model;
+        let input = Tensor::new(
+            vec![3, 3].into(),
+            vec![-2.0, -1.0, 0.0, -3.0, 0.0, -0.5, -1.0, -4.0, 0.0],
+        )?;
+        for activation in [
+            Activation::new_sigmoid(),
+            Activation::new_softplus(),
+            Activation::new_exp_negative(),
+        ] {
+            let padded = input.pad_next_power_of_two();
+            let data = activation.evaluate(&[&padded.as_wrapped()])?.outputs[0].get_data();
+            for i in 0..16 {
+                if i / 4 == 3 || i % 4 == 3 {
+                    assert_eq!(data[i], 0.0);
+                }
+            }
+            let mut model = Model::new_from_input_shapes(vec![input.shape().clone()]);
+            model.add_consecutive_layer(Layer::Activation(activation), None)?;
+            model.automatic_output_labelling()?;
+            let (model, inputs) = quantize_model(
+                model,
+                vec![input.clone()],
+                Some(vec![input.clone()]),
+                &mut Default::default(),
+            )?;
+            let (_, layer) = model
+                .graph()
+                .forward_inners()
+                .next()
+                .expect("activation node");
+            let padded = inputs[0].pad_next_power_of_two();
+            let data = layer.evaluate(&[&padded.as_wrapped()])?.outputs[0].get_data();
+            for i in 0..16 {
+                if i / 4 == 3 || i % 4 == 3 {
+                    assert_eq!(data[i], 0);
+                }
+            }
+        }
         Ok(())
     }
 

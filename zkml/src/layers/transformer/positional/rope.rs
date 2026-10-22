@@ -85,6 +85,8 @@ pub enum RopeLayout {
     /// we calculate the permuted input tensor `x_perm = [-x_n/2+1,...,-x_n,x_1,...,x_n/2]`
     /// and then the output is computed as `output = x_perm * sine_matrix + x * cosine_matrix`
     RotateHalf,
+    /// Rotate halves within fixed-size blocks. Blocks with zero angles are identities.
+    RotateBlock(usize),
 }
 
 impl RopeLayout {
@@ -96,6 +98,23 @@ impl RopeLayout {
     ) -> WrappedTensor<T> {
         let input_shape = input.shape();
         match self {
+            RopeLayout::RotateBlock(block) => {
+                let shape = Shape::from(input.shape());
+                assert!(block.is_power_of_two() && *block >= 2 && shape.dim(-1) % block == 0);
+                let mut values = input.get_data();
+                for row in values.chunks_exact_mut(*block) {
+                    let (left, right) = row.split_at_mut(block / 2);
+                    for (a, b) in left.iter_mut().zip(right) {
+                        let previous = *a;
+                        *a = T::zero() - *b;
+                        *b = previous;
+                    }
+                }
+                let tensor =
+                    Tensor::new_with_unpadded_shape(shape, input.unpadded_shape().into(), values)
+                        .expect("RoPE shape preserved");
+                WrappedTensor::try_from(&tensor).expect("RoPE rank preserved")
+            }
             RopeLayout::Adjacent => {
                 // In this case we need to split the input tensor in half along the last dimension, but first we reshape so the
                 // the tensor has shape [*, seq_len, head_size / 2, 2]
@@ -237,6 +256,13 @@ impl RopeLayout {
 
     fn permuted_eq_poly<F: PrimeField>(&self, eq_evals: &[F], row_size: usize) -> Vec<F> {
         match self {
+            RopeLayout::RotateBlock(block) => eq_evals
+                .chunks(*block)
+                .flat_map(|chunk| {
+                    let (left, right) = chunk.split_at(block / 2);
+                    right.iter().copied().chain(left.iter().map(|x| -*x))
+                })
+                .collect(),
             RopeLayout::Adjacent => eq_evals
                 .chunks(2)
                 .flat_map(|chunk| vec![chunk[1], F::ZERO - chunk[0]])
@@ -264,6 +290,12 @@ impl RopeLayout {
         row_num_vars: usize,
     ) -> F {
         match self {
+            RopeLayout::RotateBlock(block) => {
+                let bit = block.ilog2() as usize - 1;
+                identity_eval(&eq_point[..bit], &sumcheck_point[..bit])
+                    * (eq_point[bit] - sumcheck_point[bit])
+                    * identity_eval(&eq_point[bit + 1..], &sumcheck_point[bit + 1..])
+            }
             RopeLayout::Adjacent => evaluate_permutation_eq_poly(eq_point, sumcheck_point),
             RopeLayout::RotateHalf => {
                 let no_final_var_eval = identity_eval(
@@ -317,7 +349,7 @@ impl<N: TensorTypeParam> Rope<N> {
                         cosine_data.append(&mut vec![cosine; 2]);
                         sine_data.append(&mut vec![sine; 2]);
                     }
-                    RopeLayout::RotateHalf => {
+                    RopeLayout::RotateHalf | RopeLayout::RotateBlock(_) => {
                         // In this layout the trig values are repeated only once per half a row
                         tmp_cosine.push(cosine);
                         tmp_sine.push(sine);
@@ -331,6 +363,19 @@ impl<N: TensorTypeParam> Rope<N> {
                 cosine_data.append(&mut cosines);
                 let mut sines = [tmp_sine.clone(), tmp_sine].concat();
                 sine_data.append(&mut sines);
+            } else if let RopeLayout::RotateBlock(block) = layout {
+                ensure!(
+                    block.is_power_of_two() && block >= 2 && angles.len() * 2 % block == 0,
+                    "Invalid rotary block width"
+                );
+                for chunk in tmp_cosine.chunks(block / 2) {
+                    cosine_data.extend_from_slice(chunk);
+                    cosine_data.extend_from_slice(chunk);
+                }
+                for chunk in tmp_sine.chunks(block / 2) {
+                    sine_data.extend_from_slice(chunk);
+                    sine_data.extend_from_slice(chunk);
+                }
             }
         }
 
@@ -466,6 +511,7 @@ impl<N: TensorTypeParam> Rope<N> {
     fn claim_for_committed_matrix<F: PrimeField>(&self, claim: &mut Claim<F>) {
         match self.layout {
             RopeLayout::Adjacent => claim.point.remove(0),
+            RopeLayout::RotateBlock(block) => claim.point.remove(block.ilog2() as usize - 1),
             RopeLayout::RotateHalf => {
                 let row_vars = ceil_log2(self.cosine_matrix.shape().dim(-1));
                 claim.point.remove(row_vars - 1)
@@ -842,11 +888,9 @@ impl Rope<Element> {
         // and `self.sine_matrix` have pairwise identical elements in each column. In this way, the size
         // of the polynomial being committed is halved
 
-        let matrix_to_evals = match self.layout {
-            RopeLayout::Adjacent => |matrix: &Tensor<Element>| {
-                matrix.data().chunks(2).map(|chunk| chunk[0]).collect_vec()
-            },
-            RopeLayout::RotateHalf => |matrix: &Tensor<Element>| {
+        let matrix_to_evals = |matrix: &Tensor<Element>| match self.layout {
+            RopeLayout::Adjacent => matrix.data().chunks(2).map(|chunk| chunk[0]).collect_vec(),
+            RopeLayout::RotateHalf => {
                 let rows = matrix.shape().dim(-1);
                 let half_rows = rows / 2;
                 matrix
@@ -854,7 +898,12 @@ impl Rope<Element> {
                     .chunks(rows)
                     .flat_map(|chunk| chunk[..half_rows].to_vec())
                     .collect::<Vec<Element>>()
-            },
+            }
+            RopeLayout::RotateBlock(block) => matrix
+                .data()
+                .chunks(block)
+                .flat_map(|chunk| chunk[..block / 2].iter().copied())
+                .collect_vec(),
         };
         let wrapped_cosine_matrix = self.cosine_matrix.wrapped_tensor()?.clone();
         let cosine_matrix = Tensor::try_from(&wrapped_cosine_matrix)?.pad_next_power_of_two();
@@ -1010,6 +1059,7 @@ impl RopeCtx {
     fn claim_for_committed_matrix<F: PrimeField>(&self, claim: &mut Claim<F>) {
         match self.layout {
             RopeLayout::Adjacent => claim.point.remove(0),
+            RopeLayout::RotateBlock(block) => claim.point.remove(block.ilog2() as usize - 1),
             RopeLayout::RotateHalf => {
                 let row_vars = ceil_log2(self.unpadded_shape.dim(-1));
                 claim.point.remove(row_vars - 1)
@@ -1079,6 +1129,74 @@ mod tests {
         (0..num_angles)
             .map(|_| rng.gen_range(0.0..2.0 * PI))
             .collect_vec()
+    }
+
+    #[test]
+    fn qwen_partial_rope_identity_tail_and_cached_parity() -> anyhow::Result<()> {
+        // First four of sixteen features rotate; zero-frequency blocks stay exact.
+        let angles = vec![1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let rope = Rope::<f32>::build_from_angles(
+            angles,
+            "partial_rope".to_string().into(),
+            8,
+            RopeLayout::RotateBlock(4),
+        )?;
+        let input = Tensor::new(
+            vec![5, 16].into(),
+            (0..80).map(|x| x as f32 / 8.0 - 3.0).collect(),
+        )?;
+        let whole_cache = Arc::new(Mutex::new(PositionalCache::new()));
+        let full = rope.evaluate(&input.as_wrapped(), &whole_cache)?.outputs[0].get_data();
+        let cache = Arc::new(Mutex::new(PositionalCache::new()));
+        let prefix = Tensor::new(vec![2, 16].into(), input.data()[..32].to_vec())?;
+        let mut incremental = rope.evaluate(&prefix.as_wrapped(), &cache)?.outputs[0].get_data();
+        for t in 2..5 {
+            let row = Tensor::new(
+                vec![1, 16].into(),
+                input.data()[t * 16..(t + 1) * 16].to_vec(),
+            )?;
+            incremental.extend(rope.evaluate(&row.as_wrapped(), &cache)?.outputs[0].get_data());
+        }
+        assert_eq!(full, incremental);
+        for t in 0..5 {
+            assert_eq!(
+                &full[t * 16 + 4..(t + 1) * 16],
+                &input.data()[t * 16 + 4..(t + 1) * 16]
+            );
+            for pair in 0..2 {
+                let phase = t as f32 * [1.0, 0.1][pair];
+                let a = input.data()[t * 16 + pair];
+                let b = input.data()[t * 16 + pair + 2];
+                assert!((full[t * 16 + pair] - (a * phase.cos() - b * phase.sin())).abs() < 1e-6);
+                assert!(
+                    (full[t * 16 + pair + 2] - (b * phase.cos() + a * phase.sin())).abs() < 1e-6
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_partial_rope_proves_with_padded_sequence_and_heads() -> anyhow::Result<()> {
+        for block in [2, 4] {
+            let mut angles = vec![0.0; 8];
+            for (i, angle) in angles.iter_mut().take(block / 2).enumerate() {
+                *angle = 10000.0f32.powf(-2.0 * i as f32 / block as f32);
+            }
+            let mut model = Model::new_from_input_shapes(vec![vec![3, 5, 16].into()]);
+            model.add_consecutive_layer(
+                Layer::Positional(Positional::new_rope(
+                    angles,
+                    format!("partial_{block}").into(),
+                    8,
+                    RopeLayout::RotateBlock(block),
+                )?),
+                None,
+            )?;
+            model.automatic_output_labelling()?;
+            prove_model(model, &mut GenStore::default())?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -1295,6 +1413,10 @@ mod tests {
                     let (p1, p2) = match layout {
                         RopeLayout::Adjacent => { (2 * k, 2 * k + 1) },
                         RopeLayout::RotateHalf => { (k, embedding_size / 2 + k) },
+                        RopeLayout::RotateBlock(block) => {
+                            let start = (k / (block / 2)) * block;
+                            (start + k % (block / 2), start + block / 2 + k % (block / 2))
+                        },
                     };
                     let x1 = in_data[row * embedding_size + p1];
                     let x2 = in_data[row * embedding_size + p2];

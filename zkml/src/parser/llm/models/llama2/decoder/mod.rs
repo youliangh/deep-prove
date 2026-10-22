@@ -74,7 +74,8 @@ impl LayerInsertion for Llama2Decoder {
         model.add_edge(post_ffn_id, final_add_id, (0, 1))?;
         let md = TransformerMetadata {
             norm_id: post_input_norm_id,
-            transformer: attention_md,
+            transformer: Some(attention_md),
+            linear_attention: None,
             ffn: ffn_md,
         };
         Ok((final_add_id, md))

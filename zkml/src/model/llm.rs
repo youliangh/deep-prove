@@ -70,6 +70,15 @@ pub fn continuation_tokens(
     prompt_len: usize,
     eos: Token,
 ) -> anyhow::Result<Vec<Token>> {
+    continuation_tokens_with_eos(output_rows, prompt_len, &[eos])
+}
+
+pub fn continuation_tokens_with_eos(
+    output_rows: &[Token],
+    prompt_len: usize,
+    eos: &[Token],
+) -> anyhow::Result<Vec<Token>> {
+    ensure!(!eos.is_empty(), "At least one EOS token is required");
     ensure!(prompt_len > 0, "The tokenized prompt must not be empty");
     ensure!(
         output_rows.len() >= prompt_len,
@@ -77,7 +86,9 @@ pub fn continuation_tokens(
     );
     let continuation = &output_rows[prompt_len - 1..];
     ensure!(
-        !continuation[..continuation.len() - 1].contains(&eos),
+        !continuation[..continuation.len() - 1]
+            .iter()
+            .any(|token| eos.contains(token)),
         "Continuation contains tokens after EOS"
     );
     Ok(continuation.to_vec())
@@ -97,6 +108,7 @@ fn numeric_tokens<N: Number>(values: &[N], vocab_size: usize) -> anyhow::Result<
         .collect()
 }
 
+#[cfg(test)]
 fn validate_sequence(
     prompt: &[Token],
     input: &[Token],
@@ -105,6 +117,21 @@ fn validate_sequence(
     vocab_size: usize,
     eos: Token,
 ) -> anyhow::Result<Vec<Token>> {
+    validate_sequence_with_eos(prompt, input, output, max_context, vocab_size, &[eos])
+}
+
+fn validate_sequence_with_eos(
+    prompt: &[Token],
+    input: &[Token],
+    output: &[Token],
+    max_context: usize,
+    vocab_size: usize,
+    eos: &[Token],
+) -> anyhow::Result<Vec<Token>> {
+    ensure!(
+        !eos.is_empty() && eos.iter().all(|token| token.0 < vocab_size),
+        "EOS tokens must be nonempty and within the vocabulary"
+    );
     ensure!(!prompt.is_empty(), "The tokenized prompt must not be empty");
     ensure!(
         max_context > 0 && input.len() <= max_context,
@@ -136,20 +163,31 @@ fn validate_sequence(
             "Input token at position {i} is not the preceding output prediction"
         );
     }
-    let continuation = continuation_tokens(output, prompt.len(), eos)?;
+    let continuation = continuation_tokens_with_eos(output, prompt.len(), eos)?;
     ensure!(
-        input.len() == max_context || continuation.last() == Some(&eos),
+        input.len() == max_context || continuation.last().is_some_and(|token| eos.contains(token)),
         "Generation ended before its token limit without EOS"
     );
     Ok(continuation)
 }
 
+#[cfg(test)]
 fn validate_llm_io<F: PrimeField>(
     io: &IO<F>,
     prompt: &[Token],
     max_context: usize,
     vocab_size: usize,
     eos: Token,
+) -> anyhow::Result<Vec<Token>> {
+    validate_llm_io_with_eos(io, prompt, max_context, vocab_size, &[eos])
+}
+
+fn validate_llm_io_with_eos<F: PrimeField>(
+    io: &IO<F>,
+    prompt: &[Token],
+    max_context: usize,
+    vocab_size: usize,
+    eos: &[Token],
 ) -> anyhow::Result<Vec<Token>> {
     ensure!(
         io.input.len() == 1 && io.output.len() == 1,
@@ -193,7 +231,7 @@ fn validate_llm_io<F: PrimeField>(
         tokens.push(values);
     }
     io.validate_split_binding()?;
-    validate_sequence(prompt, &tokens[0], &tokens[1], max_context, vocab_size, eos)
+    validate_sequence_with_eos(prompt, &tokens[0], &tokens[1], max_context, vocab_size, eos)
 }
 
 /// The main struct responsible to verify an LLM proof.
@@ -561,7 +599,7 @@ where
         );
         let length = output.unpadded_shape().dim(0);
         let tokens = numeric_tokens(&output.data()[..length], self.md.vocab_size())?;
-        continuation_tokens(&tokens, prompt_len, self.md.config.eos_token)
+        continuation_tokens_with_eos(&tokens, prompt_len, &self.md.eos_tokens())
     }
 
     /// Generate a sentence.
@@ -643,7 +681,12 @@ where
         let mut input_handles = tensor_to_handles(&[input_tensor], &self.model.graph, store)?;
 
         let mut generated_tokens = Vec::with_capacity(max_window - num_input_tokens + 1);
-        let eos_token: N = self.md.config.eos_token.as_tensor_type_param();
+        let eos_tokens: Vec<N> = self
+            .md
+            .eos_tokens()
+            .iter()
+            .map(Token::as_tensor_type_param)
+            .collect();
 
         // Resolve each prediction before scheduling the next token: EOS must not
         // leave speculative tokens in the softmax/normalisation caches used by
@@ -686,7 +729,7 @@ where
 
             let token = last_token_tensor.get_data()[0];
             generated_tokens.push(token);
-            if token == eos_token {
+            if eos_tokens.contains(&token) {
                 break;
             }
 
@@ -730,13 +773,13 @@ where
             let input_tokens = numeric_tokens(input.data(), self.md.vocab_size())?;
             let output = trace.outputs()[0].tensor()?;
             let all_predictions = numeric_tokens(output.data(), self.md.vocab_size())?;
-            validate_sequence(
+            validate_sequence_with_eos(
                 &prompt_tokens,
                 &input_tokens,
                 &all_predictions,
                 max_window,
                 self.md.vocab_size(),
-                self.md.config.eos_token,
+                &self.md.eos_tokens(),
             )?;
             anyhow::Ok(())
         })();
@@ -832,8 +875,7 @@ impl Driver<Element> {
             chunking_strategy,
             &self.model,
             executor_config,
-        )
-        .expect("unable to generate proof");
+        )?;
         info!("Proof generated");
         Ok(proof)
     }
@@ -878,10 +920,18 @@ impl Driver<Element> {
         );
         let _entered = span.enter();
         let chunking_strategy = DefaultChunkingStrategy::from(&trace);
+        // Recurrent-state certificates scale as sequence × heads × key × value.
+        // Commit/prove bounded groups sequentially; boundary commitments bind
+        // every group into the same complete-model statement.
+        let chunks = if self.md.transformers.iter().any(|block| block.linear_attention.is_some()) {
+            None
+        } else {
+            Some(1)
+        };
         self.chunked_prove_local::<_, _, _, SequentialExecutor>(
             ctx,
             trace,
-            Some(1),
+            chunks,
             chunking_strategy,
             (),
         )
@@ -902,12 +952,12 @@ where
             max_context > 0 && max_context <= self.md.context_length(),
             "Verifier context length is outside the loaded model context"
         );
-        validate_llm_io(
+        validate_llm_io_with_eos(
             io,
             prompt,
             max_context,
             self.md.vocab_size(),
-            self.md.config.eos_token,
+            &self.md.eos_tokens(),
         )
     }
 
@@ -949,6 +999,47 @@ mod generation_tests {
 
     fn tokens(values: &[usize]) -> Vec<Token> {
         values.iter().copied().map(Token::from).collect()
+    }
+
+    #[test]
+    fn multiple_eos_tokens_stop_generation_and_bind_public_sequence() -> anyhow::Result<()> {
+        let mut driver = tiny_driver()?;
+        driver.md.additional_eos_tokens = tokens(&[3]);
+        let prompt = tokens(&[0, 1]);
+        let trace = driver.generate(&prompt, 6, &mut GenStore::default())?;
+        assert_eq!(
+            driver.continuation_tokens(&trace, prompt.len())?,
+            tokens(&[2, 3])
+        );
+        let io = public_io(&[0, 1, 2], &[1, 2, 3])?;
+        assert_eq!(
+            validate_llm_io_with_eos(&io, &prompt, 7, 8, &driver.md.eos_tokens())?,
+            tokens(&[2, 3])
+        );
+        assert!(
+            validate_sequence(
+                &prompt,
+                &tokens(&[0, 1, 2]),
+                &tokens(&[1, 2, 3]),
+                7,
+                8,
+                7usize.into()
+            )
+            .is_err()
+        );
+        assert!(continuation_tokens_with_eos(&tokens(&[1, 2, 3, 4]), 2, &tokens(&[3, 7])).is_err());
+        assert!(
+            validate_sequence_with_eos(
+                &prompt,
+                &tokens(&[0, 1, 2, 3]),
+                &tokens(&[1, 2, 3, 4]),
+                7,
+                8,
+                &tokens(&[3, 7])
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     fn public_io(input: &[usize], output: &[usize]) -> anyhow::Result<IO<F>> {
@@ -1001,6 +1092,7 @@ mod generation_tests {
         Ok(Driver {
             model,
             md: LLMMetadata {
+                additional_eos_tokens: Vec::new(),
                 config: LLMConfig {
                     model_name: "generation_test".into(),
                     embedding_size: 8,

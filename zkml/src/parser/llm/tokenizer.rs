@@ -34,6 +34,12 @@ pub trait TokenizerLoader<DataFormat> {
 pub struct HFTokenizer {
     /// The underlying HuggingFace tokenizer
     tokenizer: InnerTokenizer,
+    #[serde(default = "legacy_trim_leading_space")]
+    trim_leading_space: bool,
+}
+
+fn legacy_trim_leading_space() -> bool {
+    true
 }
 
 impl HFTokenizer {
@@ -42,7 +48,16 @@ impl HFTokenizer {
     pub fn from_tokenizer_json_path(path: &Path) -> Result<Self> {
         let tokenizer = InnerTokenizer::from_file(path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer.json: {e}"))?;
-        Ok(Self { tokenizer })
+        Ok(Self {
+            tokenizer,
+            trim_leading_space: true,
+        })
+    }
+
+    /// Preserve the exact decoded text, including meaningful initial whitespace.
+    pub fn with_exact_decoding(mut self) -> Self {
+        self.trim_leading_space = false;
+        self
     }
 
     /// Create a SentencePiece/Unigram tokenizer from GGUF loader
@@ -84,7 +99,10 @@ impl HFTokenizer {
         tokenizer.with_pre_tokenizer(Some(Metaspace::new('▁', PrependScheme::First, true)));
         tokenizer.with_decoder(Some(MetaspaceDecoder::new('▁', PrependScheme::First, true)));
 
-        Ok(Self { tokenizer })
+        Ok(Self {
+            tokenizer,
+            trim_leading_space: true,
+        })
     }
 
     /// Create a BPE tokenizer from GGUF loader
@@ -143,7 +161,10 @@ impl HFTokenizer {
             tokenizer.id_to_token(eos_id).is_some(),
             "no EOS token present"
         );
-        Ok(Self { tokenizer })
+        Ok(Self {
+            tokenizer,
+            trim_leading_space: true,
+        })
     }
 }
 
@@ -171,7 +192,11 @@ impl LLMTokenizer for HFTokenizer {
             .expect("Failed to detokenize");
 
         // GPT2 ByteLevel encoding adds a leading space, remove it if present
-        decoded.strip_prefix(' ').unwrap_or(&decoded).to_string()
+        if self.trim_leading_space {
+            decoded.strip_prefix(' ').unwrap_or(&decoded).to_string()
+        } else {
+            decoded
+        }
     }
 }
 
@@ -189,6 +214,24 @@ fn parse_merges(merges: &[String]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qwen_exact_decoding_preserves_initial_whitespace_and_legacy_default() {
+        use super::*;
+        let tokenizer = HFTokenizer {
+            tokenizer: InnerTokenizer::new(BPE::new(
+                [(" Paris".to_owned(), 0)].into_iter().collect(),
+                Vec::new(),
+            )),
+            trim_leading_space: true,
+        };
+        let tokens = [LLMToken::from(0usize)];
+        assert_eq!(tokenizer.detokenize(&tokens), "Paris");
+        assert_eq!(
+            tokenizer.with_exact_decoding().detokenize(&tokens),
+            " Paris"
+        );
+    }
+
     use crate::parser::{
         ModelNameProvider, file_cache,
         gguf::RawGGUF,

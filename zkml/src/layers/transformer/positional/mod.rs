@@ -131,6 +131,19 @@ impl<N: TensorTypeParam> PositionalVariant<N> {
 }
 
 impl<N: TensorTypeParam> Positional<N> {
+    /// Static arithmetic settings, excluding learned/generated matrices and caches.
+    pub(crate) fn quantization_summary(&self) -> serde_json::Value {
+        match &self.variant {
+            PositionalVariant::Absolute(_) => serde_json::json!({
+                "variant": "absolute", "shape": self.shape(),
+            }),
+            PositionalVariant::Rope(rope) => serde_json::json!({
+                "variant": "rope", "shape": self.shape(),
+                "unpadded_shape": rope.unpadded_shape, "layout": rope.layout,
+            }),
+        }
+    }
+
     pub fn shape(&self) -> Shape {
         match &self.variant {
             PositionalVariant::Absolute(abs) => abs.positional.shape().clone(),
@@ -214,6 +227,25 @@ impl<N: TensorTypeParam> Positional<N> {
                 layout,
             )?,
         )))
+    }
+
+    /// Text-only Qwen partial RoPE: rotate the leading `rotary_dim` coordinates.
+    pub fn new_partial_rope_from_frequency(
+        base_frequency: f32,
+        base_frequency_id: CommitmentId,
+        head_size: usize,
+        rotary_dim: usize,
+        max_context_length: usize,
+    ) -> Result<Self> {
+        ensure!(rotary_dim >= 2 && rotary_dim.is_power_of_two()
+            && head_size.is_power_of_two() && rotary_dim <= head_size,
+            "Partial RoPE requires power-of-two head/rotary dimensions");
+        let mut angles = vec![0.0; head_size / 2];
+        for (i, angle) in angles[..rotary_dim / 2].iter_mut().enumerate() {
+            *angle = base_frequency.powf(-2.0 * i as f32 / rotary_dim as f32);
+        }
+        Self::new_rope(angles, base_frequency_id, max_context_length,
+            RopeLayout::RotateBlock(rotary_dim))
     }
 
     pub fn new_rope_from_matrices(

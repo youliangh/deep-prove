@@ -1,3 +1,8 @@
+use self::transformer::{
+    causal_conv1d::{CausalConv1d, CausalConv1dCtx, CausalConv1dProof},
+    gated_delta::{GatedDeltaScan, GatedDeltaScanCtx, GatedDeltaScanProof},
+    normalisation::qwen_norm::{QwenNorm, QwenNormCtx, QwenNormProof},
+};
 use crate::{
     Element, InitTranscript, ProverContext, ScalingStrategy, Shape,
     graph::NodeId,
@@ -95,6 +100,10 @@ where
     Logits(Logits),
     Split(SplitLayer),
     Recombination(RecombinationLayer),
+    // Append new variants to preserve serialized legacy discriminants.
+    QwenNorm(QwenNorm<T>),
+    CausalConv1d(CausalConv1d<T>),
+    GatedDeltaScan(GatedDeltaScan<T>),
 }
 
 impl<T> Layer<T>
@@ -110,6 +119,9 @@ where
             Layer::Flatten(_) => FLATTEN_LAYER,
             Layer::LayerNorm(_) => LAYERNORM_LAYER,
             Layer::RMSNorm(_) => RMSNORM_LAYER,
+            Layer::QwenNorm(_) => "QNRM",
+            Layer::CausalConv1d(_) => "CC1D",
+            Layer::GatedDeltaScan(_) => "GDSC",
             Layer::Softmax(_) => SOFTMAX_LAYER,
             Layer::Add(_) => ADD_LAYER,
             Layer::Reshape(_) => RESHAPE_LAYER,
@@ -136,6 +148,9 @@ where
             Layer::EinSum(_) => "einsum",
             Layer::LayerNorm(_) => "layer-norm",
             Layer::RMSNorm(_) => "rms-norm",
+            Layer::QwenNorm(_) => "qwen-norm",
+            Layer::CausalConv1d(_) => "causal-conv1d",
+            Layer::GatedDeltaScan(_) => "gated-delta-scan",
             Layer::Softmax(_) => "softmax",
             Layer::Add(_) => "add",
             Layer::Reshape(_) => "reshape",
@@ -156,6 +171,8 @@ where
             Layer::Softmax(softmax) => softmax.reset_cache(),
             Layer::LayerNorm(layer_norm) => layer_norm.reset_cache(),
             Layer::RMSNorm(rms_norm) => rms_norm.reset_cache(),
+            Layer::CausalConv1d(x) => x.reset_cache(),
+            Layer::GatedDeltaScan(x) => x.reset_cache(),
             _ => (),
         }
     }
@@ -189,6 +206,12 @@ pub enum LayerCtx<F: PrimeField> {
     Logits(LogitsCtx),
     Split(SplitLayer),
     Recombination(RecombinationLayer),
+    QwenNorm(QwenNormCtx),
+    CausalConv1d(CausalConv1dCtx),
+    GatedDeltaScan(GatedDeltaScanCtx),
+    /// Binds stacked and contracted axes in one sumcheck. The old EinSum
+    /// discriminant is retained exclusively for existing verifier artifacts.
+    EinSumV2(EinSumContext<F>),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -217,14 +240,22 @@ where
     SplitLayer(SplitLayerProof<F>),
     Recombination(RecombinationProof<F>),
     Dummy, // To be used for non-provable layers
+    QwenNorm(QwenNormProof<F, PCS>),
+    CausalConv1d(CausalConv1dProof<F>),
+    GatedDeltaScan(GatedDeltaScanProof<F, PCS>),
 }
 
 impl<F: PrimeField> LayerCtx<F> {
     pub fn variant_name(&self) -> String {
         match self {
-            Self::EinSum(_) => "EinSum".to_string(),
+            // Chunking uses the operation name; the serialized variant binds
+            // the proof protocol independently of that scheduling label.
+            Self::EinSum(_) | Self::EinSumV2(_) => "EinSum".to_string(),
             Self::LayerNorm(_) => "LayerNorm".to_string(),
             Self::RMSNorm(_) => "RMSNorm".to_string(),
+            Self::QwenNorm(_) => "QwenNorm".to_string(),
+            Self::GatedDeltaScan(_) => "GatedDeltaScan".to_string(),
+            Self::CausalConv1d(_) => "CausalConv1d".to_string(),
             Self::Softmax(_) => "Softmax".to_string(),
             Self::Add(_) => "Add".to_string(),
             Self::Logits(_) => "Logits".to_string(),
@@ -243,7 +274,7 @@ impl<F: PrimeField> LayerCtx<F> {
     }
 
     pub fn has_proof(&self) -> bool {
-        !matches!(self, Self::Flatten)
+        !matches!(self, Self::Flatten | Self::Reshape(_))
     }
 
     pub fn next_shape_step(&self, last_step: &ShapeStep) -> Result<ShapeStep> {
@@ -290,9 +321,12 @@ impl<F: PrimeField> LayerCtx<F> {
             }
             LayerCtx::Requant(requant_ctx) => Some(requant_ctx.lookup_tables()),
             LayerCtx::Pooling(pooling_ctx) => Some(pooling_ctx.lookup_tables()),
-            LayerCtx::EinSum(_) => None,
+            LayerCtx::EinSum(_) | LayerCtx::EinSumV2(_) => None,
             LayerCtx::LayerNorm(layernorm_ctx) => Some(layernorm_ctx.lookup_tables()),
             LayerCtx::RMSNorm(rmsnorm_ctx) => Some(rmsnorm_ctx.lookup_tables()),
+            LayerCtx::QwenNorm(rmsnorm_ctx) => Some(rmsnorm_ctx.lookup_tables()),
+            LayerCtx::GatedDeltaScan(rmsnorm_ctx) => Some(rmsnorm_ctx.lookup_tables()),
+            LayerCtx::CausalConv1d(_) => None,
             LayerCtx::Flatten => None,
             LayerCtx::Add(_) => None,
             LayerCtx::Softmax(softmax_ctx) => Some(softmax_ctx.lookup_tables()),
@@ -314,9 +348,14 @@ impl<F: PrimeField> Splittable for LayerCtx<F> {
             LayerCtx::Activation(activation_ctx) => activation_ctx.ideal_num_chunks(input_shapes),
             LayerCtx::Requant(requant_ctx) => requant_ctx.ideal_num_chunks(input_shapes),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.ideal_num_chunks(input_shapes),
-            LayerCtx::EinSum(ein_sum_context) => ein_sum_context.ideal_num_chunks(input_shapes),
+            LayerCtx::EinSum(ein_sum_context) | LayerCtx::EinSumV2(ein_sum_context) => {
+                ein_sum_context.ideal_num_chunks(input_shapes)
+            }
             LayerCtx::LayerNorm(layer_norm_ctx) => layer_norm_ctx.ideal_num_chunks(input_shapes),
             LayerCtx::RMSNorm(rmsnorm_ctx) => rmsnorm_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::QwenNorm(rmsnorm_ctx) => rmsnorm_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::GatedDeltaScan(rmsnorm_ctx) => rmsnorm_ctx.ideal_num_chunks(input_shapes),
+            LayerCtx::CausalConv1d(rmsnorm_ctx) => rmsnorm_ctx.ideal_num_chunks(input_shapes),
             LayerCtx::Flatten => None,
             LayerCtx::Add(add_ctx) => add_ctx.ideal_num_chunks(input_shapes),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.ideal_num_chunks(input_shapes),
@@ -338,9 +377,14 @@ impl<F: PrimeField> Splittable for LayerCtx<F> {
             LayerCtx::Activation(activation_ctx) => activation_ctx.is_splittable(),
             LayerCtx::Requant(requant_ctx) => requant_ctx.is_splittable(),
             LayerCtx::Pooling(pooling_ctx) => pooling_ctx.is_splittable(),
-            LayerCtx::EinSum(ein_sum_context) => ein_sum_context.is_splittable(),
+            LayerCtx::EinSum(ein_sum_context) | LayerCtx::EinSumV2(ein_sum_context) => {
+                ein_sum_context.is_splittable()
+            }
             LayerCtx::LayerNorm(layer_norm_ctx) => layer_norm_ctx.is_splittable(),
             LayerCtx::RMSNorm(rmsnorm_ctx) => rmsnorm_ctx.is_splittable(),
+            LayerCtx::QwenNorm(rmsnorm_ctx) => rmsnorm_ctx.is_splittable(),
+            LayerCtx::GatedDeltaScan(rmsnorm_ctx) => rmsnorm_ctx.is_splittable(),
+            LayerCtx::CausalConv1d(rmsnorm_ctx) => rmsnorm_ctx.is_splittable(),
             LayerCtx::Flatten => false,
             LayerCtx::Add(add_ctx) => add_ctx.is_splittable(),
             LayerCtx::Softmax(softmax_ctx) => softmax_ctx.is_splittable(),
@@ -447,6 +491,9 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Positional(positional) => positional.output_shapes(input_shapes, padding_mode),
             Layer::LayerNorm(layernorm) => layernorm.output_shapes(input_shapes, padding_mode),
             Layer::RMSNorm(rmsnorm) => rmsnorm.output_shapes(input_shapes, padding_mode),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.output_shapes(input_shapes, padding_mode),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.output_shapes(input_shapes, padding_mode),
+            Layer::GatedDeltaScan(rmsnorm) => rmsnorm.output_shapes(input_shapes, padding_mode),
             Layer::Softmax(softmax) => softmax.output_shapes(input_shapes, padding_mode),
             Layer::Embeddings(embeddings) => embeddings.output_shapes(input_shapes, padding_mode),
             Layer::Reshape(reshape) => reshape.output_shapes(input_shapes, padding_mode),
@@ -468,6 +515,9 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Convolution(convolution) => convolution.num_outputs(num_inputs),
             Layer::LayerNorm(layernorm) => layernorm.num_outputs(num_inputs),
             Layer::RMSNorm(rmsnorm) => rmsnorm.num_outputs(num_inputs),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.num_outputs(num_inputs),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.num_outputs(num_inputs),
+            Layer::GatedDeltaScan(rmsnorm) => rmsnorm.num_outputs(num_inputs),
             Layer::Softmax(softmax) => softmax.num_outputs(num_inputs),
             Layer::Add(add) => add.num_outputs(num_inputs),
             Layer::Logits(logits) => logits.num_outputs(num_inputs),
@@ -490,6 +540,9 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Convolution(convolution) => convolution.describe(),
             Layer::LayerNorm(layernorm) => layernorm.describe(),
             Layer::RMSNorm(rmsnorm) => rmsnorm.describe(),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.describe(),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.describe(),
+            Layer::GatedDeltaScan(rmsnorm) => rmsnorm.describe(),
             Layer::Softmax(softmax) => softmax.describe(),
             Layer::Add(add) => add.describe(),
             Layer::Logits(logits) => logits.describe(),
@@ -512,6 +565,9 @@ impl<N: TensorTypeParam> OpInfo for Layer<N> {
             Layer::Convolution(convolution) => convolution.is_provable(),
             Layer::LayerNorm(layernorm) => layernorm.is_provable(),
             Layer::RMSNorm(rmsnorm) => rmsnorm.is_provable(),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.is_provable(),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.is_provable(),
+            Layer::GatedDeltaScan(rmsnorm) => rmsnorm.is_provable(),
             Layer::Softmax(softmax) => softmax.is_provable(),
             Layer::Positional(positional) => positional.is_provable(),
             Layer::Add(add) => add.is_provable(),
@@ -536,6 +592,9 @@ impl Evaluate<f32> for Layer<f32> {
             Layer::Convolution(convolution) => convolution.evaluate(inputs),
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
             Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::GatedDeltaScan(rmsnorm) => rmsnorm.evaluate(inputs),
             Layer::Softmax(softmax) => softmax.evaluate(inputs),
             Layer::Add(add) => add.evaluate(inputs),
             Layer::Logits(logits) => logits.evaluate(inputs),
@@ -560,6 +619,9 @@ impl Evaluate<Element> for Layer<Element> {
             Layer::Convolution(convolution) => convolution.evaluate(inputs),
             Layer::LayerNorm(layernorm) => layernorm.evaluate(inputs),
             Layer::RMSNorm(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.evaluate(inputs),
+            Layer::GatedDeltaScan(rmsnorm) => rmsnorm.evaluate(inputs),
             Layer::Softmax(softmax) => softmax.evaluate(inputs),
             Layer::Add(add) => add.evaluate(inputs),
             Layer::Logits(logits) => logits.evaluate(inputs),
@@ -595,6 +657,9 @@ impl ProveInfo for Layer<Element> {
             Layer::Add(add) => add.step_info(aux),
             Layer::LayerNorm(layernorm) => layernorm.step_info(aux),
             Layer::RMSNorm(rmsnorm) => rmsnorm.step_info(aux),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.step_info(aux),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.step_info(aux),
+            Layer::GatedDeltaScan(rmsnorm) => rmsnorm.step_info(aux),
             Layer::Softmax(softmax) => softmax.step_info(aux),
             Layer::Logits(logits) => logits.step_info(aux),
             Layer::Positional(positional) => positional.step_info(aux),
@@ -623,6 +688,9 @@ impl PadOp for Layer<Element> {
             Layer::Add(add) => Layer::Add(add.pad_node(si)?),
             Layer::LayerNorm(layernorm) => Layer::LayerNorm(layernorm.pad_node(si)?),
             Layer::RMSNorm(rmsnorm) => Layer::RMSNorm(rmsnorm.pad_node(si)?),
+            Layer::QwenNorm(rmsnorm) => Layer::QwenNorm(rmsnorm.pad_node(si)?),
+            Layer::CausalConv1d(rmsnorm) => Layer::CausalConv1d(rmsnorm.pad_node(si)?),
+            Layer::GatedDeltaScan(rmsnorm) => Layer::GatedDeltaScan(rmsnorm.pad_node(si)?),
             Layer::Softmax(softmax) => Layer::Softmax(softmax.pad_node(si)?),
             Layer::Logits(logits) => Layer::Logits(logits.pad_node(si)?),
             Layer::Positional(positional) => Layer::Positional(positional.pad_node(si)?),
@@ -694,10 +762,19 @@ where
             (Layer::RMSNorm(rmsnorm), LayerCtx::RMSNorm(info)) => {
                 rmsnorm.prove(node_id, info, last_claims, step_data, prover)
             }
+            (Layer::QwenNorm(rmsnorm), LayerCtx::QwenNorm(info)) => {
+                rmsnorm.prove(node_id, info, last_claims, step_data, prover)
+            }
+            (Layer::GatedDeltaScan(rmsnorm), LayerCtx::GatedDeltaScan(info)) => {
+                rmsnorm.prove(node_id, info, last_claims, step_data, prover)
+            }
+            (Layer::CausalConv1d(rmsnorm), LayerCtx::CausalConv1d(info)) => {
+                rmsnorm.prove(node_id, info, last_claims, step_data, prover)
+            }
             (Layer::AttentionMask(attention_mask), LayerCtx::AttentionMask(info)) => {
                 attention_mask.prove(node_id, info, last_claims, step_data, prover)
             }
-            (Layer::EinSum(einsum), LayerCtx::EinSum(info)) => {
+            (Layer::EinSum(einsum), LayerCtx::EinSumV2(info)) => {
                 einsum.prove(node_id, info, last_claims, step_data, prover)
             }
             (Layer::Split(split), LayerCtx::Split(info)) => {
@@ -728,6 +805,9 @@ where
             Layer::Logits(logits) => logits.gen_lookup_witness(id, ctx, step_data),
             Layer::LayerNorm(layernorm) => layernorm.gen_lookup_witness(id, ctx, step_data),
             Layer::RMSNorm(rmsnorm) => rmsnorm.gen_lookup_witness(id, ctx, step_data),
+            Layer::QwenNorm(rmsnorm) => rmsnorm.gen_lookup_witness(id, ctx, step_data),
+            Layer::CausalConv1d(rmsnorm) => rmsnorm.gen_lookup_witness(id, ctx, step_data),
+            Layer::GatedDeltaScan(scan) => scan.gen_lookup_witness(id, ctx, step_data),
             Layer::Positional(positional) => positional.gen_lookup_witness(id, ctx, step_data),
             Layer::Embeddings(embeddings) => embeddings.gen_lookup_witness(id, ctx, step_data),
             Layer::Activation(activation) => activation.gen_lookup_witness(id, ctx, step_data),
@@ -808,6 +888,51 @@ impl QuantizeOp for Layer<f32> {
                 QuantizeOutput::new(Layer::RMSNorm(output.quantized_op), output.output_scalings)
                     .maybe_requants(output.requant_layer)?
                     .maybe_transform(output.post_quant_rule)?
+            }
+            Layer::QwenNorm(rmsnorm) => {
+                let output = rmsnorm.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
+                QuantizeOutput::new(Layer::QwenNorm(output.quantized_op), output.output_scalings)
+                    .maybe_requants(output.requant_layer)?
+                    .maybe_transform(output.post_quant_rule)?
+            }
+            Layer::CausalConv1d(rmsnorm) => {
+                let output = rmsnorm.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
+                QuantizeOutput::new(
+                    Layer::CausalConv1d(output.quantized_op),
+                    output.output_scalings,
+                )
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
+            }
+            Layer::GatedDeltaScan(rmsnorm) => {
+                let output = rmsnorm.quantize_op::<S>(
+                    data,
+                    node_id,
+                    input_scaling,
+                    unpadded_input_shapes,
+                    output_scalings,
+                    unpadded_output_shapes,
+                )?;
+                QuantizeOutput::new(
+                    Layer::GatedDeltaScan(output.quantized_op),
+                    output.output_scalings,
+                )
+                .maybe_requants(output.requant_layer)?
+                .maybe_transform(output.post_quant_rule)?
             }
             Layer::Softmax(softmax) => {
                 let output = softmax.quantize_op::<S>(
@@ -953,6 +1078,9 @@ where
         match self {
             Self::LayerNorm(_) => "LayerNorm".to_string(),
             Self::RMSNorm(_) => "RMSNorm".to_string(),
+            Self::QwenNorm(_) => "QwenNorm".to_string(),
+            Self::GatedDeltaScan(_) => "GatedDeltaScan".to_string(),
+            Self::CausalConv1d(_) => "CausalConv1d".to_string(),
             Self::Softmax(_) => "Softmax".to_string(),
             Self::Logits(_) => "Logits".to_string(),
             Self::Positional(_) => "Positional".to_string(),
