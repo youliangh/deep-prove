@@ -206,6 +206,121 @@ the verifier also reconstructs and checks the saved text. This local evaluation
 uses the existing DeepProve setup mechanism; it does not constitute an audited
 production trusted-setup ceremony.
 
+## Sequence-length performance sweep
+
+The sequence sweep runs each input length in a fresh process so that RSS
+high-water marks do not carry over between lengths. It uses prefixes of the
+first held-out token sequence and generates one final output token, making
+the actual certified input length exactly 32, 64, 128, or 256 tokens, even if
+that output is EOS. All runs use the complete model, the same eight calibration
+samples, and a fixed loaded context capacity of 256. The script checks that
+the frozen quantization digest remains identical across runs.
+
+```bash
+python3 zkml/assets/scripts/llms/benchmark_llama3_sequence.py \
+  --model-dir /home/yliangh/models/meta-llama/Llama-3.2-1B \
+  --lengths 32,64,128,256 --threads 8 \
+  --output-dir target/llama3/sequence-benchmark-2026-10-19
+```
+
+Use a new output directory for each sweep; `--dry-run` prints the complete
+plan without running or writing files. The default calibration and input files
+are `target/llama3/data/calibration.json` and `target/llama3/data/test.json`,
+prepared by the numerical-validation workflow above. Paths can be overridden
+with `--calibration-tokens` and `--input-tokens`.
+
+`summary.csv`, `summary.json`, and `manifest.json` are updated after each run.
+Each sequence directory retains the raw benchmark CSV, execution log, GNU
+`time -v` output, exact prompt, and verified proof artifacts. A failed run is
+marked explicitly and stops the sweep. The main measurements are:
+
+| Field | Meaning |
+| --- | --- |
+| `peak_rss_gib` | Whole-process maximum resident memory from GNU time, including loading, calibration, setup, inference, proving, and verification. |
+| `prover_seconds` | Internal `prove_full` time, excluding calibration, setup, inference, proof serialization, and the preliminary graph split/public-IO conversion. |
+| `verifier_seconds` | Internal `verify_full` cryptographic verification time, excluding artifact loading and outer LLM token-linkage checks. |
+| `proof_bytes` | Actual serialized `proof.bin` size, excluding public IO and verifier parameters. |
+
+The raw CSV also retains the process memory high-water mark observed just
+after proving. This is not an allocation delta or an isolated prover-only
+memory measurement. Calibration, setup, inference, and total wall time are
+reported separately. Each length is measured once; these observations are
+not repeated-run averages or confidence intervals.
+
+Measured on 2026-10-19 using the local `Llama-3.2-1B` checkpoint on an AMD
+EPYC 9634 VM with 8 visible CPU cores and 247.45 GiB RAM, the default CPU
+release build, 8 Rayon threads, and `MATMUL_NUM_THREADS=4`. All four independent
+processes exited successfully and their proofs passed in-process verification:
+
+| Certified input tokens | Peak process RSS (GiB) | Prover (s) | Verifier (s) | Proof bytes | Proof (MiB) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 100.485 | 403.113 | 17.272 | 25,548,428 | 24.365 |
+| 64 | 110.505 | 479.572 | 19.700 | 28,328,372 | 27.016 |
+| 128 | 140.370 | 634.675 | 22.096 | 31,148,963 | 29.706 |
+| 256 | 189.455 | 1,021.483 | 23.578 | 34,024,947 | 32.449 |
+
+The sweep took 1h43m46s in total. Per-process calibration took 309.713–321.934 s,
+and setup took 503.419–513.018 s; these costs are excluded from the prover
+column. All runs used the same accepted quantization snapshot
+`2ebfe9a192a728d7de8ff715b8873674d31cbe5c67d303cc7d1c9c5c48d1f4b3`.
+In these single observations, increasing input length from 32 to 256 raised
+prover time by 2.53x, peak process RSS by 1.89x, and proof size by 1.33x.
+
+The complete records are in `target/llama3/sequence-benchmark-2026-10-19/`.
+`measurement-checks.json` records the final cross-checks of all four metric
+rows, exact input lengths, model/calibration identities, proof file sizes,
+and successful verification records, along with artifact hashes. The exact
+runner used for this measurement is retained as `runner-executed.py`, whose
+SHA-256 matches `manifest.json`; the repository runner additionally includes
+cross-run model/calibration checks and interruption cleanup. The final
+cross-check applies those consistency checks to this completed sweep too.
+
+### 512-token extension
+
+The 2026-10-19 extension used the same weights, binary, eight calibration
+samples, and thread settings, with model capacity raised to 512. Its input
+concatenates consecutive cached WikiText test records 17–35 and takes the
+first 512 tokens; the first 256 tokens exactly match the previous benchmark.
+The input, source hashes, and preparation script are retained as
+`target/llama3/data/test512.json`, `test512-manifest.json`, and
+`prepare-test512.py`. The calibration scale snapshot remains identical, but
+the larger capacity expands the positional tables and proving context.
+
+```bash
+python3 zkml/assets/scripts/llms/benchmark_llama3_sequence.py \
+  --model-dir /home/yliangh/models/meta-llama/Llama-3.2-1B \
+  --lengths 512 --model-context 512 --threads 8 \
+  --input-tokens target/llama3/data/test512.json --max-rss-gib 225 \
+  --output-dir target/llama3/sequence-benchmark-512-2026-10-19
+```
+
+On this 247.45 GiB host, the run reached the optional 225 GiB RSS guard during
+the batched polynomial-commitment opening, after completing layer claims and
+lookup-table claims. The guard polls the benchmark child every 0.25 seconds,
+so allocations can exceed the threshold between samples. GNU time recorded
+225.580 GiB (236,537,848 KiB) peak RSS and termination by SIGTERM. This is a
+guarded, incomplete run, not an observed operating-system OOM kill, and the
+recorded peak does not establish the memory needed to finish the proof.
+
+| Input tokens | Status | Observed partial peak RSS (GiB) | Completed prover (s) | Verifier (s) | Proof bytes | Total wall (s) |
+| ---: | --- | ---: | --- | --- | --- | ---: |
+| 512 | `resource_limit` | 225.580 | unavailable | not run | not generated | 2,727.114 |
+
+The diagnostic interval from the start of proving to the guard trigger was
+1,583.451 s; it is not a completed `prove_full` measurement. No verified proof
+or success result was written. The exact command, partial RSS record, monitor,
+unverified generation, and logs are retained under
+`target/llama3/sequence-benchmark-512-2026-10-19/`. Its `measurement-checks.json`
+confirms the source/calibration identities, exact input length, partial metrics,
+and absence of successful proof artifacts. `combined-summary.csv` contains
+the four completed lengths and the explicitly incomplete 512-token row.
+
+`--max-rss-gib` is optional and Linux-specific. A triggered guard preserves
+GNU time's RSS measurement, marks the row `resource_limit`, and leaves
+unavailable proof timings and size empty. It is a polling safeguard rather
+than a hard memory limit. Without this option, the original sweep behavior
+is unchanged.
+
 ## Validation record
 
 `target/llama3/final-acceptance.json` is the final acceptance index, linking the
